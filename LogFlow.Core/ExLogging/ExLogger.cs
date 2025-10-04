@@ -31,6 +31,14 @@ namespace LogFlow.Core.ExLogging;
 /// </summary>
 public static class ExLogger
 {
+    // Static constructor to hook into process exit
+    static ExLogger()
+    {
+        // Ensure graceful cleanup during AppDomain unload or process exit
+        AppDomain.CurrentDomain.ProcessExit += static (_, __) => SafeShutdown();
+        AppDomain.CurrentDomain.DomainUnload += static (_, __) => SafeShutdown();
+    }
+
     #region Predefined Delegates for Performance
 
     // NOTE: Delegates now use Exception? to reflect that null is valid, avoiding null-suppression warnings.
@@ -157,13 +165,30 @@ public static class ExLogger
         }
     }
 
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void SafeShutdown()
+    {
+        try
+        {
+            ShutdownUtcTimer();
+        }
+        catch
+        {
+            // swallow — safe cleanup only
+        }
+    }
+
     #endregion Timestamp Cache (Allocation-Free UTC)
 
     #region Object Pool & Exception Formatter
 
     // ♻️ Pool of StringBuilders to reduce allocations when formatting exceptions
     // Shared provider allows expansion to other pooled objects later without extra providers.
-    private static readonly ObjectPoolProvider _poolProvider = new DefaultObjectPoolProvider { MaximumRetained = 128 };
+    private static readonly ObjectPoolProvider _poolProvider = new DefaultObjectPoolProvider
+    {
+        // Scale retention dynamically by core count
+        MaximumRetained = Environment.ProcessorCount * 8
+    };
 
     private static readonly ObjectPool<StringBuilder> _sbPool = _poolProvider.CreateStringBuilderPool();
 
@@ -821,12 +846,17 @@ public static class ExLogger
     #region Extensibility Hooks (Async/Batch Ready)
 
     /// <summary>
-    /// Optional hook for future async sink filtering (no behavior change now).
+    /// Optional hook for a future async/batching sink.
+    /// <para>
+    /// Currently a placeholder — allows pre-filtering of log events before
+    /// dispatch to asynchronous or external sinks (e.g., Kafka, Seq, etc.).
+    /// </para>
     /// </summary>
     public static Func<LogLevel, string, Exception, bool> AsyncSinkFilter { get; private set; } = static (_, _, _) => true;
 
     /// <summary>
     /// Configure a custom filter intended for a future async/batching sink (placeholder).
+    /// </summary>
     /// </summary>
     public static void UseAsyncSinkProvider(Func<LogLevel, string, Exception, bool> filter)
         => AsyncSinkFilter = filter ?? AsyncSinkFilter;
@@ -840,10 +870,7 @@ public static class ExLogger
     {
         try
         {
-            if (cancellationToken.IsCancellationRequested)
-            {
-                return;
-            }
+            cancellationToken.ThrowIfCancellationRequested();
 
             await Task.Yield();
 
