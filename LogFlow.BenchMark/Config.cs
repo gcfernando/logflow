@@ -12,22 +12,22 @@ public class Config : ManualConfig
 {
     public Config()
     {
-        AddLogger(ConsoleLogger.Default);
-        AddExporter(MarkdownExporter.Default);
-        AddExporter(HtmlExporter.Default);
-        AddExporter(CsvExporter.Default);
+        _ = AddLogger(ConsoleLogger.Default);
+        _ = AddExporter(MarkdownExporter.Default);
+        _ = AddExporter(HtmlExporter.Default);
+        _ = AddExporter(CsvExporter.Default);
 
-        AddColumnProvider(DefaultColumnProviders.Statistics);
+        _ = AddColumnProvider(DefaultColumnProviders.Statistics);
 
-        AddColumn(StatisticColumn.P95);
-        AddColumn(StatisticColumn.P90);
-        AddColumn(StatisticColumn.P80);
+        _ = AddColumn(StatisticColumn.P95);
+        _ = AddColumn(StatisticColumn.P90);
+        _ = AddColumn(StatisticColumn.P80);
 
-        AddColumn(TargetMethodColumn.Method, CategoriesColumn.Default);
+        _ = AddColumn(TargetMethodColumn.Method, CategoriesColumn.Default);
 
-        WithOption(ConfigOptions.DisableOptimizationsValidator, true);
+        _ = WithOption(ConfigOptions.DisableOptimizationsValidator, true);
 
-        AddJob(Job
+        _ = AddJob(Job
             .Default
             .WithRuntime(CoreRuntime.Core80)
             .WithGcForce(true)

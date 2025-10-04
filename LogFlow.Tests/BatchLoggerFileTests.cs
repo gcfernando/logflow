@@ -21,7 +21,7 @@ public class BatchLoggerFileSinkTests : IDisposable
     public BatchLoggerFileSinkTests()
     {
         _root = Path.Combine(Path.GetTempPath(), "logflow-tests", Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(_root);
+        _ = Directory.CreateDirectory(_root);
     }
 
     public void Dispose()
@@ -46,7 +46,7 @@ public class BatchLoggerFileSinkTests : IDisposable
         RollingInterval interval = RollingInterval.None, int retain = 3)
     {
         var sink = new Mock<ILogger>();
-        sink.Setup(l => l.IsEnabled(It.IsAny<LogLevel>())).Returns(true);
+        _ = sink.Setup(l => l.IsEnabled(It.IsAny<LogLevel>())).Returns(true);
 
         var opts = new BatchLoggerOptions
         {
@@ -78,7 +78,7 @@ public class BatchLoggerFileSinkTests : IDisposable
 
         Assert.True(File.Exists(path));
         var lines = await File.ReadAllLinesAsync(path);
-        Assert.Single(lines);
+        _ = Assert.Single(lines);
         Assert.Contains("[Information] hello", lines[0]);
     }
 

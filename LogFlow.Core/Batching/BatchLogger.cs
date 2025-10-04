@@ -95,14 +95,14 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
         {
             SingleReader = true,
             SingleWriter = false,
-            FullMode = BoundedChannelFullMode.DropWrite
+            FullMode = BoundedChannelFullMode.DropOldest
         });
 
-        _cts.Token.Register(() => _channel.Writer.TryComplete());
+        _ = _cts.Token.Register(() => _channel.Writer.TryComplete());
 
         // If the caller didn't provide OnFlushAsync but enabled file/database options,
         // build a composed async flush pipeline.
-        _composedFlushAsync = BuildComposedFlushIfNeeded(_options);
+        _composedFlushAsync = BuildComposedFlushIfNeeded(_options, _sink);
 
         // Start the single-reader background worker that processes the queue.
         _worker = Task.Run(() => ProcessAsync(_cts.Token), _cts.Token);
@@ -134,9 +134,21 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
 
         // Build the message and extract structured logging args if present.
         var msg = formatter != null ? formatter(state, exception) : state?.ToString() ?? "N/A";
-        var args = state is IEnumerable<KeyValuePair<string, object>> kv
-            ? [.. kv.Select(k => k.Value ?? "N/A")]
-            : Array.Empty<object>();
+
+        var args = Array.Empty<object>();
+        if (state is IEnumerable<KeyValuePair<string, object>> kvPairs)
+        {
+            var list = new List<object>(8);
+            foreach (var kv in kvPairs)
+            {
+                list.Add(kv.Value ?? "N/A");
+            }
+
+            if (list.Count > 0)
+            {
+                args = [.. list];
+            }
+        }
 
         // Optional filter: if provided by options, allow the caller to short-circuit logging.
         if (_options.Filter != null && !_options.Filter(logLevel, msg, exception, args))
@@ -631,7 +643,7 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
     /// but file and/or database sinks are enabled. Optionally includes forwarding to <see cref="ILogger"/>.
     /// Returns <c>null</c> if no composition is required, allowing the logger to use its default flush path.
     /// </summary>
-    private static Func<IReadOnlyList<BatchLogEntry>, CancellationToken, Task> BuildComposedFlushIfNeeded(BatchLoggerOptions options)
+    private static Func<IReadOnlyList<BatchLogEntry>, CancellationToken, Task> BuildComposedFlushIfNeeded(BatchLoggerOptions options, ILogger sink)
     {
         // ✅ If a custom handler was provided by the user, skip composition entirely.
         if (options.OnFlushAsync is not null)
@@ -662,7 +674,7 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
         // ✅ If at least one real sink exists and forwarding to ILogger is requested, include LoggerBatchSink
         if (options.ForwardToILoggerSink)
         {
-            activeSinks.Add(new LoggerBatchSink());
+            activeSinks.Add(new ForwardingBatchSink(sink));
         }
 
         // ✅ Return composed async delegate that writes to all active sinks
@@ -716,16 +728,21 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
         Task WriteAsync(IReadOnlyList<BatchLogEntry> entries, CancellationToken token);
     }
 
-    /// <summary>
-    /// Placeholder sink representing forwarding to the underlying <see cref="ILogger"/>.
-    /// The actual write is performed by the caller's fallback to <see cref="Flush(List{LogEntry})"/>.
-    /// </summary>
-    private sealed class LoggerBatchSink : IBatchSink
+    // ✅ Real forwarding sink to underlying ILogger
+    private sealed class ForwardingBatchSink : IBatchSink
     {
-        /// <inheritdoc />
-        public Task WriteAsync(IReadOnlyList<BatchLogEntry> entries, CancellationToken token) =>
-            // No-op: the parent logger handles forwarding to ILogger when this is the only sink.
-            Task.CompletedTask;
+        private readonly ILogger _sink;
+        public ForwardingBatchSink(ILogger sink) => _sink = sink;
+
+        public Task WriteAsync(IReadOnlyList<BatchLogEntry> entries, CancellationToken token)
+        {
+            foreach (var e in entries)
+            {
+                ExLogger.Log(_sink, e.Level, e.Message, e.Exception,
+                    e.Args is { Count: > 0 } ? [.. e.Args] : Array.Empty<object>());
+            }
+            return Task.CompletedTask;
+        }
     }
 
     /// <summary>
@@ -736,6 +753,8 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
     {
         private readonly BatchFileOptions _opts;
         private readonly BatchFormatOptions _fmt;
+
+        private static readonly JsonSerializerOptions _defaultJson = new() { WriteIndented = false };
 
         /// <summary>
         /// Creates a new file batch sink.
@@ -771,10 +790,11 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
             await using var writer = new StreamWriter(stream, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
 
             // Write each entry as a single line using the requested format.
+            var now = DateTime.UtcNow;
             foreach (var e in entries)
             {
                 token.ThrowIfCancellationRequested();
-                var line = Format(e, _fmt, _opts.Format);
+                var line = Format(e, _fmt, _opts.Format, now);
                 await writer.WriteLineAsync(line.AsMemory(), token).ConfigureAwait(false);
             }
 
@@ -841,13 +861,13 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
         }
 
         // Formats a single entry according to the configured file format and serialization options.
-        private static string Format(BatchLogEntry e, BatchFormatOptions fmt, BatchFileFormat fileFormat)
+        private static string Format(BatchLogEntry e, BatchFormatOptions fmt, BatchFileFormat fileFormat, DateTime now)
         {
             if (fileFormat == BatchFileFormat.Json)
             {
                 var payload = new
                 {
-                    tsUtc = DateTime.UtcNow,
+                    tsUtc = now,
                     level = e.Level.ToString(),
                     message = e.Message,
                     exception = e.Exception?.ToString(),
@@ -865,7 +885,7 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
 
             if (e.Args is { Count: > 0 })
             {
-                _ = sb.Append(" | args=").Append(JsonSerializer.Serialize(e.Args, fmt.JsonSerializerOptions ?? new()));
+                _ = sb.Append(" | args=").Append(JsonSerializer.Serialize(e.Args, fmt.JsonSerializerOptions ?? _defaultJson));
             }
 
             if (e.Exception is not null)
@@ -886,6 +906,8 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
     {
         private readonly BatchDatabaseOptions _opts;
         private readonly BatchFormatOptions _fmt;
+
+        private static readonly JsonSerializerOptions _defaultJson = new() { WriteIndented = false };
 
         /// <summary>
         /// Initializes a new instance of the <see cref="DatabaseBatchSink"/> class.
@@ -923,9 +945,10 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
             {
                 try
                 {
-                    await using var cmd = conn.CreateCommand();
-                    cmd.CommandText = _opts.GetCreateTableSql();
-                    _ = await cmd.ExecuteNonQueryAsync(token).ConfigureAwait(false);
+                    await using var tableCommand = conn.CreateCommand();
+                    tableCommand.Parameters.Clear();
+                    tableCommand.CommandText = _opts.GetCreateTableSql();
+                    _ = await tableCommand.ExecuteNonQueryAsync(token).ConfigureAwait(false);
                 }
                 catch
                 {
@@ -934,48 +957,39 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
             }
 
             // Insert each entry using parameterized commands (portable across providers).
-            var insertSql = _opts.GetInsertSql();
+            await using var dataCommand = conn.CreateCommand();
+            dataCommand.Parameters.Clear();
+            dataCommand.CommandText = _opts.GetInsertSql();
+
+            var pTs = dataCommand.CreateParameter();
+            pTs.ParameterName = _opts.ColTimestamp;
+            _ = dataCommand.Parameters.Add(pTs);
+            var pLvl = dataCommand.CreateParameter();
+            pLvl.ParameterName = _opts.ColLevel;
+            _ = dataCommand.Parameters.Add(pLvl);
+            var pMsg = dataCommand.CreateParameter();
+            pMsg.ParameterName = _opts.ColMessage;
+            _ = dataCommand.Parameters.Add(pMsg);
+            var pExc = dataCommand.CreateParameter();
+            pExc.ParameterName = _opts.ColException;
+            _ = dataCommand.Parameters.Add(pExc);
+            var pArgs = dataCommand.CreateParameter();
+            pArgs.ParameterName = _opts.ColArgsJson;
+            _ = dataCommand.Parameters.Add(pArgs);
 
             foreach (var e in entries)
             {
                 token.ThrowIfCancellationRequested();
 
-                await using var cmd = conn.CreateCommand();
-                cmd.CommandText = insertSql;
-
-                // Timestamp (UTC)
-                var pTs = cmd.CreateParameter();
-                pTs.ParameterName = _opts.ColTimestamp;
                 pTs.Value = DateTime.UtcNow;
-                _ = cmd.Parameters.Add(pTs);
-
-                // Level (string)
-                var pLvl = cmd.CreateParameter();
-                pLvl.ParameterName = _opts.ColLevel;
                 pLvl.Value = e.Level.ToString();
-                _ = cmd.Parameters.Add(pLvl);
-
-                // Message
-                var pMsg = cmd.CreateParameter();
-                pMsg.ParameterName = _opts.ColMessage;
                 pMsg.Value = e.Message ?? "";
-                _ = cmd.Parameters.Add(pMsg);
-
-                // Exception (nullable)
-                var pExc = cmd.CreateParameter();
-                pExc.ParameterName = _opts.ColException;
                 pExc.Value = e.Exception?.ToString() ?? (object)DBNull.Value;
-                _ = cmd.Parameters.Add(pExc);
-
-                // Args as JSON (nullable)
-                var pArgs = cmd.CreateParameter();
-                pArgs.ParameterName = _opts.ColArgsJson;
                 pArgs.Value = (e.Args is { Count: > 0 })
-                    ? JsonSerializer.Serialize(e.Args, _fmt.JsonSerializerOptions ?? new())
+                    ? JsonSerializer.Serialize(e.Args, _fmt.JsonSerializerOptions ?? _defaultJson)
                     : DBNull.Value;
-                _ = cmd.Parameters.Add(pArgs);
 
-                _ = await cmd.ExecuteNonQueryAsync(token).ConfigureAwait(false);
+                _ = await dataCommand.ExecuteNonQueryAsync(token).ConfigureAwait(false);
             }
         }
     }
