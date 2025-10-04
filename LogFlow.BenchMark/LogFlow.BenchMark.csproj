@@ -21,5 +21,11 @@
 		<AllowUnsafeBlocks>false</AllowUnsafeBlocks>
 		<TreatWarningsAsErrors>true</TreatWarningsAsErrors>
 	</PropertyGroup>
-	
+
+	<ItemGroup>
+		<PackageReference Include="BenchmarkDotNet" Version="0.15.4" />
+		<PackageReference Include="Microsoft.Extensions.Logging.Console" Version="9.0.9" />
+
+		<ProjectReference Include="..\LogFlow.Core\LogFlow.Core.csproj" />
+	</ItemGroup>
 </Project>
