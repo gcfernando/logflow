@@ -5,6 +5,12 @@ using Moq;
 
 namespace LogFlow.Tests;
 
+/*
+ * Developer ::> Gehan Fernando 
+ * Date      ::> 2025-10-01
+ * Contact   ::> f.gehan@gmail.com / + 46 73 701 40 25
+*/
+
 public class ExLoggerTests
 {
     private readonly Mock<ILogger> _mockLogger;

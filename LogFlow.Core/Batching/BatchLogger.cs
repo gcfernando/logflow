@@ -92,8 +92,10 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
         {
             SingleReader = true,
             SingleWriter = false,
-            FullMode = BoundedChannelFullMode.DropOldest
+            FullMode = BoundedChannelFullMode.DropWrite
         });
+
+        _cts.Token.Register(() => _channel.Writer.TryComplete());
 
         // If the caller didn't provide OnFlushAsync but enabled file/database options,
         // build a composed async flush pipeline.
@@ -246,10 +248,14 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
     /// </summary>
     private void Enqueue(LogEntry entry)
     {
-        if (!_channel.Writer.TryWrite(entry))
+        // If writer is completed or cannot accept more, treat as a drop
+        if (_channel.Writer.TryWrite(entry))
         {
-            Metrics.IncrementDropped();
+            return;
         }
+
+        // Either full (DropWrite) or writer already completed — count as drop
+        Metrics.IncrementDropped();
     }
 
     /// <summary>
@@ -371,13 +377,14 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
     /// <param name="token">Cancellation token to cooperatively cancel the flush.</param>
     public async Task FlushAsync(CancellationToken token = default)
     {
+        token.ThrowIfCancellationRequested(); // ✅ Immediate cooperative check
+
         // Drain whatever is currently in the channel to make this flush as complete as possible.
         while (_channel.Reader.TryRead(out var e))
         {
-            token.ThrowIfCancellationRequested();
+            token.ThrowIfCancellationRequested(); // keep it also here for long reads
             _buffer.Add(e);
 
-            // Optionally chunk large buffers when using custom sinks to reduce per-call payload size.
             if (_buffer.Count >= _options.BatchSize)
             {
                 if (_options.OnFlushAsync is not null || _composedFlushAsync is not null)
@@ -393,12 +400,12 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
 
         if (_buffer.Count == 0)
         {
-            // Keep method truly async to avoid sync-over-async surprises in callers.
             await Task.Yield();
             return;
         }
 
-        // Choose custom sink pipeline if configured; else default to direct ILogger.
+        token.ThrowIfCancellationRequested(); // ✅ Check again before doing work
+
         if (_options.OnFlushAsync is not null || _composedFlushAsync is not null)
         {
             await FlushViaCustomSinkAsync(token).ConfigureAwait(false);
@@ -414,6 +421,7 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
     /// <summary>
     /// Flushes the in-memory buffer using the configured custom sink delegate or composed sinks.
     /// Falls back to direct sink flush upon exceptions to reduce data loss.
+    /// Also forwards entries to the underlying ILogger when forwarding is enabled.
     /// </summary>
     private async Task FlushViaCustomSinkAsync(CancellationToken token)
     {
@@ -431,6 +439,7 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
 
         try
         {
+            // ✅ Execute either the user-provided or composed sink delegate.
             if (_options.OnFlushAsync is not null)
             {
                 await _options.OnFlushAsync(snapshot, token).ConfigureAwait(false);
@@ -441,33 +450,47 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
             }
             else
             {
-                // Should never happen, but if it does, use direct sink flush.
+                // No async sinks available — use direct fallback flush.
                 Flush(_buffer);
                 return;
             }
 
-            // Mirror metrics behavior of the direct flush path.
+            // ✅ Also forward to underlying ILogger if requested (to preserve standard log sinks)
+            if (_options.ForwardToILoggerSink)
+            {
+                foreach (var e in snapshot)
+                {
+                    ExLogger.Log(
+                        _sink,
+                        e.Level,
+                        e.Message,
+                        e.Exception,
+                        e.Args is { Count: > 0 } ? [.. e.Args] : Array.Empty<object>());
+                }
+            }
+
+            // ✅ Update metrics to mirror direct flush path
             Metrics.AddFlushed(snapshot.Count);
             Metrics.SetLastFlush(DateTime.UtcNow);
         }
         catch (OperationCanceledException)
         {
-            // Cooperatively propagate cancellation.
+            // Propagate cooperative cancellation
             throw;
         }
         catch (Exception ex)
         {
-            // Notify the optional internal error handler and attempt a best-effort fallback flush.
+            // Log and notify internal errors
             try
             {
                 _options.OnInternalError?.Invoke("BatchLogger OnFlushAsync handler error", ex);
             }
             catch
             {
-                // Swallow exceptions from the error handler itself.
+                // Swallow secondary diagnostics errors
             }
 
-            // Fallback to the synchronous underlying sink flush to avoid losing data.
+            // Fallback to synchronous flush to minimize data loss
             await Task.Run(() => Flush(_buffer), token).ConfigureAwait(false);
         }
         finally
@@ -588,12 +611,12 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
 
     /// <summary>
     /// Builds a composed async flush delegate when <see cref="BatchLoggerOptions.OnFlushAsync"/> is not provided
-    /// but file and/or database sinks are enabled. Optionally includes forwarding to <see cref="ILogger"/> behavior.
-    /// Returns <c>null</c> if no composition is needed.
+    /// but file and/or database sinks are enabled. Optionally includes forwarding to <see cref="ILogger"/>.
+    /// Returns <c>null</c> if no composition is required, allowing the logger to use its default flush path.
     /// </summary>
     private static Func<IReadOnlyList<BatchLogEntry>, CancellationToken, Task> BuildComposedFlushIfNeeded(BatchLoggerOptions options)
     {
-        // If the user provided a custom handler, no composition is required.
+        // ✅ If a custom handler was provided by the user, skip composition entirely.
         if (options.OnFlushAsync is not null)
         {
             return null;
@@ -601,28 +624,31 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
 
         var activeSinks = new List<IBatchSink>(capacity: 4);
 
+        // ✅ Add file sink if enabled
         if (options.File?.Enabled == true)
         {
             activeSinks.Add(new FileBatchSink(options.File, options.Format));
         }
 
+        // ✅ Add database sink if enabled
         if (options.Database?.Enabled == true)
         {
             activeSinks.Add(new DatabaseBatchSink(options.Database, options.Format));
         }
 
-        // Retain the "forward to ILogger" behavior by including a no-op sink placeholder.
+        // ✅ If no real sinks, return null → BatchLogger falls back to default ILogger flushing
+        if (activeSinks.Count == 0)
+        {
+            return null;
+        }
+
+        // ✅ If at least one real sink exists and forwarding to ILogger is requested, include LoggerBatchSink
         if (options.ForwardToILoggerSink)
         {
             activeSinks.Add(new LoggerBatchSink());
         }
 
-        if (activeSinks.Count == 0)
-        {
-            return null; // Nothing to compose.
-        }
-
-        // Compose: attempt all sinks; surface errors via OnInternalError but do not throw.
+        // ✅ Return composed async delegate that writes to all active sinks
         return async (entries, token) =>
         {
             List<Exception> errors = [];
@@ -635,18 +661,26 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
                 }
                 catch (OperationCanceledException)
                 {
-                    throw; // Preserve cooperative cancellation.
+                    // Preserve cooperative cancellation for upstream callers
+                    throw;
                 }
                 catch (Exception ex)
                 {
+                    // Track the sink error, and notify via OnInternalError if configured
                     errors.Add(ex);
                     try
-                    { options.OnInternalError?.Invoke($"{sink.GetType().Name} error", ex); }
-                    catch { /* ignore secondary errors */ }
+                    {
+                        options.OnInternalError?.Invoke($"{sink.GetType().Name} error", ex);
+                    }
+                    catch
+                    {
+                        // Never propagate secondary failures from diagnostics
+                    }
                 }
             }
 
-            // If any sink failed, we already notified via OnInternalError. Best-effort write was attempted.
+            // Optional future telemetry or aggregation of `errors` could go here.
+            // For now, we simply swallow after notifying the error handler.
         };
     }
 
