@@ -7,3 +7,5 @@
 /LogFlow.Core/obj
 /LogFlow.Tests/bin
 /LogFlow.Tests/obj
+/LogFlow.BenchMark/bin
+/LogFlow.BenchMark/obj
