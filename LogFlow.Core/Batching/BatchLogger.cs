@@ -425,21 +425,26 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
     /// </summary>
     private async Task FlushViaCustomSinkAsync(CancellationToken token)
     {
-        if (_buffer.Count == 0)
-        {
-            return;
-        }
+        List<BatchLogEntry> snapshot;
 
-        // Build a stable snapshot in the public-facing entry shape.
-        List<BatchLogEntry> snapshot = new(_buffer.Count);
-        foreach (var e in _buffer)
+        // 🔒 Lock around the entire snapshot read/clear section
+        lock (_buffer)
         {
-            snapshot.Add(new BatchLogEntry(e.Level, e.Message, e.Exception, e.Args));
+            if (_buffer.Count == 0)
+            {
+                return; // nothing to flush
+            }
+
+            // Create a stable snapshot
+            snapshot = _buffer
+                .ConvertAll(e => new BatchLogEntry(e.Level, e.Message, e.Exception, e.Args));
+
+            _buffer.Clear(); // clear now that we've captured everything
         }
 
         try
         {
-            // ✅ Execute either the user-provided or composed sink delegate.
+            // ✅ Execute either the user-provided or composed sink delegate
             if (_options.OnFlushAsync is not null)
             {
                 await _options.OnFlushAsync(snapshot, token).ConfigureAwait(false);
@@ -450,12 +455,18 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
             }
             else
             {
-                // No async sinks available — use direct fallback flush.
-                Flush(_buffer);
+                // ✅ FIX: call Flush on internal buffer type, not snapshot
+                lock (_buffer)
+                {
+                    if (_buffer.Count > 0)
+                    {
+                        Flush(_buffer);
+                    }
+                }
                 return;
             }
 
-            // ✅ Also forward to underlying ILogger if requested (to preserve standard log sinks)
+            // ✅ Also forward to underlying ILogger if requested
             if (_options.ForwardToILoggerSink)
             {
                 foreach (var e in snapshot)
@@ -475,8 +486,7 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
         }
         catch (OperationCanceledException)
         {
-            // Propagate cooperative cancellation
-            throw;
+            throw; // propagate cooperative cancellation
         }
         catch (Exception ex)
         {
@@ -492,10 +502,6 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
 
             // Fallback to synchronous flush to minimize data loss
             await Task.Run(() => Flush(_buffer), token).ConfigureAwait(false);
-        }
-        finally
-        {
-            _buffer.Clear();
         }
     }
 
