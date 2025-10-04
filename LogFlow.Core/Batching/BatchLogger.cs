@@ -55,7 +55,10 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
 
     // NOTE: _buffer is only touched by the background worker and flush methods
     // after the worker has been cancelled/awaited. It is NOT thread-safe by design.
-    private readonly List<LogEntry> _buffer;
+    private List<LogEntry> _buffer = [];
+
+    // Lock object used to synchronize flush operations when a custom async sink is configured.
+    private readonly object _sync = new();
 
     // Effective options for this logger instance.
     private readonly BatchLoggerOptions _options;
@@ -377,45 +380,53 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
     /// <param name="token">Cancellation token to cooperatively cancel the flush.</param>
     public async Task FlushAsync(CancellationToken token = default)
     {
-        token.ThrowIfCancellationRequested(); // ✅ Immediate cooperative check
+        token.ThrowIfCancellationRequested();
 
-        // Drain whatever is currently in the channel to make this flush as complete as possible.
-        while (_channel.Reader.TryRead(out var e))
+        // Drain any remaining channel items before swapping
+        while (_channel.Reader.TryRead(out var entry))
         {
-            token.ThrowIfCancellationRequested(); // keep it also here for long reads
-            _buffer.Add(e);
-
-            if (_buffer.Count >= _options.BatchSize)
-            {
-                if (_options.OnFlushAsync is not null || _composedFlushAsync is not null)
-                {
-                    await FlushViaCustomSinkAsync(token).ConfigureAwait(false);
-                }
-                else
-                {
-                    Flush(_buffer);
-                }
-            }
+            _buffer.Add(entry);
         }
 
-        if (_buffer.Count == 0)
+        // Atomically swap buffers — lock-free
+        var toFlush = Interlocked.Exchange(ref _buffer, new List<LogEntry>(_options.BatchSize));
+
+        if (toFlush.Count == 0)
         {
-            await Task.Yield();
             return;
         }
 
-        token.ThrowIfCancellationRequested(); // ✅ Check again before doing work
+        var snapshot = toFlush.ConvertAll(e => new BatchLogEntry(e.Level, e.Message, e.Exception, e.Args));
 
-        if (_options.OnFlushAsync is not null || _composedFlushAsync is not null)
+        try
         {
-            await FlushViaCustomSinkAsync(token).ConfigureAwait(false);
-        }
-        else
-        {
-            Flush(_buffer);
-        }
+            if (_options.OnFlushAsync is not null)
+            {
+                await _options.OnFlushAsync(snapshot, token).ConfigureAwait(false);
+            }
+            else if (_composedFlushAsync is not null)
+            {
+                await _composedFlushAsync(snapshot, token).ConfigureAwait(false);
+            }
+            else
+            {
+                foreach (var e in toFlush)
+                {
+                    ExLogger.Log(_sink, e.Level, e.Message, e.Exception, e.Args);
+                }
+            }
 
-        await Task.Yield();
+            Metrics.AddFlushed(snapshot.Count);
+            Metrics.SetLastFlush(DateTime.UtcNow);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _options.OnInternalError?.Invoke("BatchLogger flush error", ex);
+        }
     }
 
     /// <summary>
@@ -428,7 +439,7 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
         List<BatchLogEntry> snapshot;
 
         // 🔒 Lock around the entire snapshot read/clear section
-        lock (_buffer)
+        lock (_sync)
         {
             if (_buffer.Count == 0)
             {
@@ -456,7 +467,7 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
             else
             {
                 // ✅ FIX: call Flush on internal buffer type, not snapshot
-                lock (_buffer)
+                lock (_sync)
                 {
                     if (_buffer.Count > 0)
                     {
