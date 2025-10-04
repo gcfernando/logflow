@@ -2,6 +2,12 @@
 
 namespace LogFlow.Core.Batching.Model;
 
+/*
+ * Developer ::> Gehan Fernando 
+ * Date      ::> 2025-10-01
+ * Contact   ::> f.gehan@gmail.com / + 46 73 701 40 25
+*/
+
 /// <summary>
 /// Represents a single structured log entry within a batched logging operation.
 /// </summary>

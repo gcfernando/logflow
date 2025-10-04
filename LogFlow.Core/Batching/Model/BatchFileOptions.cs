@@ -3,6 +3,12 @@ using LogFlow.Core.Batching.Model.Enums;
 
 namespace LogFlow.Core.Batching.Model;
 
+/*
+ * Developer ::> Gehan Fernando 
+ * Date      ::> 2025-10-01
+ * Contact   ::> f.gehan@gmail.com / + 46 73 701 40 25
+*/
+
 /// <summary>
 /// Represents configuration options for writing batched log entries to rolling log files.
 /// </summary>

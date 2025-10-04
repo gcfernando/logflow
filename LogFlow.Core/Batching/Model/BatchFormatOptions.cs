@@ -2,6 +2,12 @@
 
 namespace LogFlow.Core.Batching.Model;
 
+/*
+ * Developer ::> Gehan Fernando 
+ * Date      ::> 2025-10-01
+ * Contact   ::> f.gehan@gmail.com / + 46 73 701 40 25
+*/
+
 /// <summary>
 /// Provides advanced formatting options for serialized or text-based log output.
 /// </summary>

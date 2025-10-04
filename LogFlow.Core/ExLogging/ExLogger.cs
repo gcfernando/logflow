@@ -8,6 +8,12 @@ using Microsoft.Extensions.ObjectPool;
 
 namespace LogFlow.Core.ExLogging;
 
+/*
+ * Developer ::> Gehan Fernando 
+ * Date      ::> 2025-10-01
+ * Contact   ::> f.gehan@gmail.com / + 46 73 701 40 25
+*/
+
 /// <summary>
 /// ExLogger: A high-performance static logging helper for .NET applications.
 /// <para>

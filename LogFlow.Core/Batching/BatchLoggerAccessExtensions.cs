@@ -4,6 +4,12 @@ using Microsoft.Extensions.Logging;
 
 namespace LogFlow.Core.Batching;
 
+/*
+ * Developer ::> Gehan Fernando 
+ * Date      ::> 2025-10-01
+ * Contact   ::> f.gehan@gmail.com / + 46 73 701 40 25
+*/
+
 /// <summary>
 /// Provides extension methods for accessing <see cref="BatchLogger"/> functionality
 /// and metrics from a standard <see cref="ILogger"/> instance.
