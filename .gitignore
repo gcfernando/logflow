@@ -5,3 +5,5 @@
 /LogFlow.Core/bin
 /.vs/LogFlow
 /LogFlow.Core/obj
+/LogFlow.Tests/bin
+/LogFlow.Tests/obj
