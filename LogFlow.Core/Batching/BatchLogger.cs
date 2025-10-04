@@ -946,7 +946,6 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
                 try
                 {
                     await using var tableCommand = conn.CreateCommand();
-                    tableCommand.Parameters.Clear();
                     tableCommand.CommandText = _opts.GetCreateTableSql();
                     _ = await tableCommand.ExecuteNonQueryAsync(token).ConfigureAwait(false);
                 }
@@ -958,7 +957,6 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
 
             // Insert each entry using parameterized commands (portable across providers).
             await using var dataCommand = conn.CreateCommand();
-            dataCommand.Parameters.Clear();
             dataCommand.CommandText = _opts.GetInsertSql();
 
             var pTs = dataCommand.CreateParameter();

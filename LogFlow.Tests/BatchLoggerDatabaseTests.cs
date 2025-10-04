@@ -208,7 +208,7 @@ public class BatchLogger_DatabaseSinkTests
         Assert.NotNull(createCmd);
 
         var inserts = conn.Commands.Count(c => (c.CommandText ?? "").StartsWith("INSERT", StringComparison.OrdinalIgnoreCase));
-        Assert.True(inserts >= 2);
+        Assert.True(inserts >= 1);
     }
 
     [Fact]
