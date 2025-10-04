@@ -6,7 +6,7 @@ using System.Text;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.ObjectPool;
 
-namespace LogFlow.Core;
+namespace LogFlow.Core.ExLogging;
 
 /// <summary>
 /// ExLogger: A high-performance static logging helper for .NET applications.
@@ -140,9 +140,9 @@ public static class ExLogger
         try
         {
             // Final atomic update before disposing the timer.
-            Interlocked.Exchange(ref _cachedUtc, FormatUtc());
+            _ = Interlocked.Exchange(ref _cachedUtc, FormatUtc());
 
-            _utcCacheTimer.Change(Timeout.Infinite, Timeout.Infinite);
+            _ = _utcCacheTimer.Change(Timeout.Infinite, Timeout.Infinite);
             _utcCacheTimer.Dispose();
         }
         catch (ObjectDisposedException)
@@ -840,19 +840,4 @@ public static class ExLogger
     }
 
     #endregion Extensibility Hooks (Async/Batch Ready)
-}
-
-/// <summary>
-/// Represents a no-op logging scope.
-/// Prevents null reference exceptions when BeginScope() returns null.
-/// </summary>
-internal sealed class NullScope : IDisposable
-{
-    public static readonly NullScope Instance = new();
-
-    private NullScope()
-    { }
-
-    public void Dispose()
-    { }
 }
