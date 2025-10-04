@@ -82,13 +82,12 @@ public static class ExLogger
     #region Cached EventIds
 
     // 🔒 Cached EventIds for each log level to avoid allocating new instances at runtime
-    private static readonly EventId _traceId = new((int)LogLevel.Trace, "TraceEvent");
-
-    private static readonly EventId _debugId = new((int)LogLevel.Debug, "DebugEvent");
-    private static readonly EventId _infoId = new((int)LogLevel.Information, "InformationEvent");
-    private static readonly EventId _warnId = new((int)LogLevel.Warning, "WarningEvent");
-    private static readonly EventId _errorId = new((int)LogLevel.Error, "ErrorEvent");
-    private static readonly EventId _criticalId = new((int)LogLevel.Critical, "CriticalEvent");
+    private static readonly EventId _traceId = new(1, "TraceEvent");
+    private static readonly EventId _debugId = new(2, "DebugEvent");
+    private static readonly EventId _infoId = new(3, "InformationEvent");
+    private static readonly EventId _warnId = new(4, "WarningEvent");
+    private static readonly EventId _errorId = new(5, "ErrorEvent");
+    private static readonly EventId _criticalId = new(6, "CriticalEvent");
 
     // ✅ Cached instead of creating a new EventId for unknown levels each time
     private static readonly EventId _unknownId = new(9999, "UnknownEvent");
@@ -117,14 +116,14 @@ public static class ExLogger
     //  • Per-ms allocation: a single new string for the cache (not per log event)
     //  • Completely thread-safe and lock-free.
 
+    // ✅ Initialize _utcBuffer first (so it's ready before timer starts)
+    private static readonly ThreadLocal<char[]> _utcBuffer = new(() => new char[33]);
+
+    // ✅ Now safe to start timer (it may trigger immediately)
     private static readonly Timer _utcCacheTimer = new(UpdateUtc, null, 0, 1);
 
     // Always points to the latest formatted UTC string; updated every 1 ms.
     private static volatile string _cachedUtc = FormatUtc();
-
-    // Per-thread reusable buffer for TryFormat to avoid transient char[] allocations.
-    // The "O" (round-trip) format length is 33 characters.
-    private static readonly ThreadLocal<char[]> _utcBuffer = new(() => new char[33]);
 
     // --- Timer callback (static to avoid closure allocations) --------------------
     private static void UpdateUtc(object _) =>
@@ -135,7 +134,8 @@ public static class ExLogger
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static string FormatUtc()
     {
-        var buf = _utcBuffer.Value!;
+        // ✅ Defensive: handle potential null (safety)
+        var buf = _utcBuffer?.Value ?? new char[33];
         _ = DateTime.UtcNow.TryFormat(buf, out var len, "O", CultureInfo.InvariantCulture);
         return new string(buf, 0, len);
     }
@@ -605,9 +605,16 @@ public static class ExLogger
     public static IDisposable ExBeginScope(this ILogger logger, string key, object value)
     {
         ArgumentNullException.ThrowIfNull(logger);
-        return string.IsNullOrWhiteSpace(key)
-            ? throw new ArgumentException("Key cannot be null or whitespace.", nameof(key))
-            : logger.BeginScope(new SingleScope(key, value)) ?? NullScope.Instance;
+
+        if (string.IsNullOrWhiteSpace(key))
+        {
+            throw new ArgumentException("Key cannot be null or whitespace.", nameof(key));
+        }
+
+        var scope = new SingleScope(key, value);
+
+        // Try BeginScope; if it returns null (e.g., in unit tests), wrap our scope in a disposable
+        return logger.BeginScope(scope) ?? new DisposableScope(scope);
     }
 
     /// <summary>
@@ -617,12 +624,12 @@ public static class ExLogger
     public static IDisposable ExBeginScope(this ILogger logger, IDictionary<string, object> context)
     {
         ArgumentNullException.ThrowIfNull(logger);
+
         if (context is null || context.Count == 0)
         {
             return NullScope.Instance;
         }
 
-        // ⚡ Optimization: use array wrapper for small contexts
         if (context.Count <= 4)
         {
             var items = new KeyValuePair<string, object>[context.Count];
@@ -631,17 +638,20 @@ public static class ExLogger
             {
                 items[i++] = new KeyValuePair<string, object>(kv.Key, kv.Value ?? "N/A");
             }
-            return logger.BeginScope(new SmallScopeWrapper(items)) ?? NullScope.Instance;
+
+            var wrapper = new SmallScopeWrapper(items);
+            return logger.BeginScope(wrapper) ?? new DisposableScope(wrapper);
         }
         else
         {
-            // Fallback: use List wrapper for larger contexts
             var safe = new List<KeyValuePair<string, object>>(context.Count);
             foreach (var kv in context)
             {
                 safe.Add(new KeyValuePair<string, object>(kv.Key, kv.Value ?? "N/A"));
             }
-            return logger.BeginScope(new ScopeWrapper(safe)) ?? NullScope.Instance;
+
+            var wrapper = new ScopeWrapper(safe);
+            return logger.BeginScope(wrapper) ?? new DisposableScope(wrapper);
         }
     }
 
@@ -795,6 +805,15 @@ public static class ExLogger
             }
             return sb.ToString();
         }
+    }
+
+    private sealed class DisposableScope : IDisposable
+    {
+        private readonly object _state;
+        public DisposableScope(object state) => _state = state;
+        public void Dispose() { }
+
+        public override string ToString() => _state.ToString() ?? string.Empty;
     }
 
     #endregion Log Scope Helper
