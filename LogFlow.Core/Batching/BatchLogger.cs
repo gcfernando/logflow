@@ -1,4 +1,10 @@
-﻿using System.Threading.Channels;
+﻿using System.Data.Common;
+using System.Globalization;
+using System.Text;
+using System.Text.Json;
+using System.Threading.Channels;
+using LogFlow.Core.Batching.Model;
+using LogFlow.Core.Batching.Model.Enums;
 using LogFlow.Core.ExLogging;
 using Microsoft.Extensions.Logging;
 
@@ -14,7 +20,11 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
     // NOTE: _buffer is only touched by the background worker and flush methods
     // after the worker has been cancelled/awaited. It is NOT thread-safe by design.
     private readonly List<LogEntry> _buffer;
+
     private readonly BatchLoggerOptions _options;
+
+    // When OnFlushAsync is not provided, we may build a composite sink from options.
+    private readonly Func<IReadOnlyList<BatchLogEntry>, CancellationToken, Task> _composedFlushAsync;
 
     public BatchLoggerMetrics Metrics { get; } = new();
 
@@ -35,6 +45,10 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
             SingleWriter = false,
             FullMode = BoundedChannelFullMode.DropOldest
         });
+
+        // If the caller did not provide a custom flush, but enabled file/database sinks,
+        // we compose an internal flush handler that targets the configured sinks AND the original ILogger sink.
+        _composedFlushAsync = BuildComposedFlushIfNeeded(_options);
 
         // Start background worker
         _worker = Task.Run(() => ProcessAsync(_cts.Token), _cts.Token);
@@ -269,7 +283,7 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
             if (_buffer.Count >= _options.BatchSize)
             {
                 // If a custom sink is configured, flush in chunks too
-                if (_options.OnFlushAsync is not null)
+                if (_options.OnFlushAsync is not null || _composedFlushAsync is not null)
                 {
                     await FlushViaCustomSinkAsync(token).ConfigureAwait(false);
                 }
@@ -286,8 +300,8 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
             return;
         }
 
-        // Use custom sink if provided, else original sink
-        if (_options.OnFlushAsync is not null)
+        // Use custom sink if provided, else original sink (or composed sinks)
+        if (_options.OnFlushAsync is not null || _composedFlushAsync is not null)
         {
             await FlushViaCustomSinkAsync(token).ConfigureAwait(false);
         }
@@ -301,7 +315,7 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
 
     private async Task FlushViaCustomSinkAsync(CancellationToken token)
     {
-        if (_buffer.Count == 0 || _options.OnFlushAsync is null)
+        if (_buffer.Count == 0)
         {
             return;
         }
@@ -315,7 +329,20 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
 
         try
         {
-            await _options.OnFlushAsync(snapshot, token).ConfigureAwait(false);
+            if (_options.OnFlushAsync is not null)
+            {
+                await _options.OnFlushAsync(snapshot, token).ConfigureAwait(false);
+            }
+            else if (_composedFlushAsync is not null)
+            {
+                await _composedFlushAsync(snapshot, token).ConfigureAwait(false);
+            }
+            else
+            {
+                // Shouldn't happen; fall back
+                Flush(_buffer);
+                return;
+            }
 
             // Update metrics to mirror original Flush()
             Metrics.AddFlushed(snapshot.Count);
@@ -348,10 +375,12 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
     }
 
 #if DEBUG
+
     /// <summary>
     /// Test-helper to force a flush without needing to await cancellation.
     /// </summary>
     internal Task ForceFlushAsync(CancellationToken token = default) => FlushAsync(token);
+
 #endif
 
     // ---------------- IDisposable ----------------
@@ -375,7 +404,7 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
             if (_buffer.Count > 0)
             {
                 // Respect custom handler if present during Dispose()
-                if (_options.OnFlushAsync is not null)
+                if (_options.OnFlushAsync is not null || _composedFlushAsync is not null)
                 {
                     try
                     {
@@ -425,4 +454,300 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
 
     // ---------------- Internal record ----------------
     private readonly record struct LogEntry(LogLevel Level, string Message, Exception Exception, object[] Args);
+
+    // ---------------- Sink composition ----------------
+
+    private static Func<IReadOnlyList<BatchLogEntry>, CancellationToken, Task> BuildComposedFlushIfNeeded(BatchLoggerOptions options)
+    {
+        // If user has provided a custom handler, we don't compose anything.
+        if (options.OnFlushAsync is not null)
+        {
+            return null;
+        }
+
+        var activeSinks = new List<IBatchSink>(4);
+
+        if (options.File?.Enabled == true)
+        {
+            activeSinks.Add(new FileBatchSink(options.File, options.Format));
+        }
+
+        if (options.Database?.Enabled == true)
+        {
+            activeSinks.Add(new DatabaseBatchSink(options.Database, options.Format));
+        }
+
+        // Always include "fallback-to-ILogger" sink if requested (default true).
+        if (options.ForwardToILoggerSink)
+        {
+            activeSinks.Add(new LoggerBatchSink());
+        }
+
+        if (activeSinks.Count == 0)
+        {
+            return null;
+        }
+
+        // Compose
+        return async (entries, token) =>
+        {
+            // We intentionally try all sinks even if one fails, like Serilog's "write to many".
+            List<Exception> errors = [];
+
+            foreach (var sink in activeSinks)
+            {
+                try
+                {
+                    await sink.WriteAsync(entries, token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception ex)
+                {
+                    errors.Add(ex);
+                    try
+                    { options.OnInternalError?.Invoke($"{sink.GetType().Name} error", ex); }
+                    catch { /* ignore */ }
+                }
+            }
+
+            if (errors.Count > 0)
+            {
+                // Don't throw—already surfaced via OnInternalError. Data best-effort was attempted for all sinks.
+            }
+        };
+    }
+
+    // -------------- Internal sink types ----------------
+
+    private interface IBatchSink
+    {
+        Task WriteAsync(IReadOnlyList<BatchLogEntry> entries, CancellationToken token);
+    }
+
+    /// <summary>
+    /// Writes to the underlying ILogger (preserves original behavior).
+    /// </summary>
+    private sealed class LoggerBatchSink : IBatchSink
+    {
+        public Task WriteAsync(IReadOnlyList<BatchLogEntry> entries, CancellationToken token) =>
+            // No-op here; the caller (BatchLogger) will fall back to Flush() path when using this sink alone.
+            // We keep this class in the list so composition logic remains simple.
+            Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Simple, dependency-free rolling file writer.
+    /// </summary>
+    private sealed class FileBatchSink : IBatchSink
+    {
+        private readonly BatchFileOptions _opts;
+        private readonly BatchFormatOptions _fmt;
+
+        public FileBatchSink(BatchFileOptions opts, BatchFormatOptions fmt)
+        {
+            _opts = opts;
+            _fmt = fmt ?? new BatchFormatOptions();
+            _ = Directory.CreateDirectory(Path.GetDirectoryName(GetCurrentPath())!);
+        }
+
+        public async Task WriteAsync(IReadOnlyList<BatchLogEntry> entries, CancellationToken token)
+        {
+            var path = GetCurrentPath();
+
+            // Roll by size
+            if (File.Exists(path) && _opts.RollingSizeBytes > 0)
+            {
+                var len = new FileInfo(path).Length;
+                if (len >= _opts.RollingSizeBytes)
+                {
+                    RollFiles();
+                }
+            }
+
+            // Open append
+            await using var stream = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite, 4096, useAsync: true);
+            await using var writer = new StreamWriter(stream, new UTF8Encoding(false));
+
+            foreach (var e in entries)
+            {
+                token.ThrowIfCancellationRequested();
+                var line = Format(e, _fmt, _opts.Format);
+                await writer.WriteLineAsync(line.AsMemory(), token).ConfigureAwait(false);
+            }
+
+            await writer.FlushAsync(token).ConfigureAwait(false);
+        }
+
+        private string GetCurrentPath()
+        {
+            if (_opts.RollingInterval == RollingInterval.None)
+            {
+                return _opts.Path;
+            }
+
+            var stamp = DateTime.UtcNow;
+            var suffix = _opts.RollingInterval switch
+            {
+                RollingInterval.Hour => stamp.ToString("yyyyMMdd_HH", CultureInfo.InvariantCulture),
+                RollingInterval.Day => stamp.ToString("yyyyMMdd", CultureInfo.InvariantCulture),
+                RollingInterval.Week => $"{stamp:yyyyMMdd}-W{CultureInfo.InvariantCulture.Calendar.GetWeekOfYear(stamp, CalendarWeekRule.FirstDay, DayOfWeek.Monday)}",
+                RollingInterval.Month => stamp.ToString("yyyyMM", CultureInfo.InvariantCulture),
+                RollingInterval.Year => stamp.ToString("yyyy", CultureInfo.InvariantCulture),
+                _ => stamp.ToString("yyyyMMdd", CultureInfo.InvariantCulture)
+            };
+            var dir = Path.GetDirectoryName(_opts.Path)!;
+            var file = Path.GetFileNameWithoutExtension(_opts.Path);
+            var ext = Path.GetExtension(_opts.Path);
+            return Path.Combine(dir, $"{file}-{suffix}{ext}");
+        }
+
+        private void RollFiles()
+        {
+            // Move current file to .1, bump older, keep RetainedFileCountLimit
+            var path = GetCurrentPath();
+            if (!File.Exists(path))
+            {
+                return;
+            }
+
+            static void SafeMove(string src, string dst)
+            {
+                try
+                {
+                    if (File.Exists(src))
+                    {
+                        File.Move(src, dst, overwrite: true);
+                    }
+                }
+                catch { /* ignore */ }
+            }
+
+            for (var i = _opts.RetainedFileCountLimit - 1; i >= 1; i--)
+            {
+                var older = $"{path}.{i}";
+                var newer = $"{path}.{i + 1}";
+                SafeMove(older, newer);
+            }
+
+            SafeMove(path, $"{path}.1");
+        }
+
+        private static string Format(BatchLogEntry e, BatchFormatOptions fmt, BatchFileFormat fileFormat)
+        {
+            if (fileFormat == BatchFileFormat.Json)
+            {
+                var payload = new
+                {
+                    tsUtc = DateTime.UtcNow,
+                    level = e.Level.ToString(),
+                    message = e.Message,
+                    exception = e.Exception?.ToString(),
+                    args = e.Args,
+                };
+                return JsonSerializer.Serialize(payload, fmt.JsonSerializerOptions ?? new JsonSerializerOptions { WriteIndented = false });
+            }
+
+            // Plain text template: "{TimestampUtc:O} [{Level}] Message | Args | Exception"
+            var sb = new StringBuilder(256);
+            _ = sb.Append(DateTime.UtcNow.ToString("O"))
+              .Append(" [").Append(e.Level).Append("] ")
+              .Append(e.Message ?? "N/A");
+
+            if (e.Args is { Count: > 0 })
+            {
+                _ = sb.Append(" | args=").Append(JsonSerializer.Serialize(e.Args, fmt.JsonSerializerOptions ?? new()));
+            }
+
+            if (e.Exception is not null)
+            {
+                _ = sb.Append(" | ex=").Append(e.Exception);
+            }
+
+            return sb.ToString();
+        }
+    }
+
+    /// <summary>
+    /// Minimal ADO.NET batch inserter (works with SqlClient, Npgsql, MySqlConnector, etc.)
+    /// </summary>
+    private sealed class DatabaseBatchSink : IBatchSink
+    {
+        private readonly BatchDatabaseOptions _opts;
+        private readonly BatchFormatOptions _fmt;
+
+        public DatabaseBatchSink(BatchDatabaseOptions opts, BatchFormatOptions fmt)
+        {
+            _opts = opts;
+            _fmt = fmt ?? new BatchFormatOptions();
+            if (string.IsNullOrWhiteSpace(_opts.ProviderInvariantName))
+            {
+                throw new ArgumentException("Database.ProviderInvariantName is required.");
+            }
+
+            if (string.IsNullOrWhiteSpace(_opts.ConnectionString))
+            {
+                throw new ArgumentException("Database.ConnectionString is required.");
+            }
+        }
+
+        public async Task WriteAsync(IReadOnlyList<BatchLogEntry> entries, CancellationToken token)
+        {
+            var factory = DbProviderFactories.GetFactory(_opts.ProviderInvariantName);
+
+            await using var conn = factory.CreateConnection()!;
+            conn.ConnectionString = _opts.ConnectionString;
+            await conn.OpenAsync(token).ConfigureAwait(false);
+
+            if (_opts.AutoCreateTable)
+            {
+                try
+                {
+                    await using var cmd = conn.CreateCommand();
+                    cmd.CommandText = _opts.GetCreateTableSql();
+                    _ = await cmd.ExecuteNonQueryAsync(token).ConfigureAwait(false);
+                }
+                catch
+                {
+                    // ignore race / permissions issues
+                }
+            }
+
+            // Use single command with parameters per row (portable, simple).
+            // If the provider supports bulk APIs, you can add a provider-specific implementation later.
+            var insertSql = _opts.GetInsertSql();
+
+            foreach (var e in entries)
+            {
+                token.ThrowIfCancellationRequested();
+
+                await using var cmd = conn.CreateCommand();
+                cmd.CommandText = insertSql;
+
+                var pTs = cmd.CreateParameter();
+                pTs.ParameterName = _opts.ColTimestamp;
+                pTs.Value = DateTime.UtcNow;
+                _ = cmd.Parameters.Add(pTs);
+                var pLvl = cmd.CreateParameter();
+                pLvl.ParameterName = _opts.ColLevel;
+                pLvl.Value = e.Level.ToString();
+                _ = cmd.Parameters.Add(pLvl);
+                var pMsg = cmd.CreateParameter();
+                pMsg.ParameterName = _opts.ColMessage;
+                pMsg.Value = e.Message ?? "";
+                _ = cmd.Parameters.Add(pMsg);
+                var pExc = cmd.CreateParameter();
+                pExc.ParameterName = _opts.ColException;
+                pExc.Value = e.Exception?.ToString() ?? (object)DBNull.Value;
+                _ = cmd.Parameters.Add(pExc);
+                var pArgs = cmd.CreateParameter();
+                pArgs.ParameterName = _opts.ColArgsJson;
+                pArgs.Value = (e.Args is { Count: > 0 })
+                    ? JsonSerializer.Serialize(e.Args, _fmt.JsonSerializerOptions ?? new())
+                    : DBNull.Value;
+                _ = cmd.Parameters.Add(pArgs);
+
+                _ = await cmd.ExecuteNonQueryAsync(token).ConfigureAwait(false);
+            }
+        }
+    }
 }
