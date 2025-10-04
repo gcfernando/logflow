@@ -25,10 +25,6 @@ namespace LogFlow.Core;
 /// </summary>
 public static class ExLogger
 {
-    // =============================================================================================================
-    // REGION: Predefined Delegates for Performance
-    // -------------------------------------------------------------------------------------------------------------
-
     #region Predefined Delegates for Performance
 
     // NOTE: Delegates now use Exception? to reflect that null is valid, avoiding null-suppression warnings.
@@ -77,10 +73,6 @@ public static class ExLogger
 
     #endregion Predefined Delegates for Performance
 
-    // =============================================================================================================
-    // REGION: Cached EventIds
-    // -------------------------------------------------------------------------------------------------------------
-
     #region Cached EventIds
 
     // 🔒 Cached EventIds for each log level to avoid allocating new instances at runtime
@@ -111,10 +103,6 @@ public static class ExLogger
     };
 
     #endregion Cached EventIds
-
-    // =============================================================================================================
-    // REGION: Timestamp Cache (Allocation-Free UTC)
-    // -------------------------------------------------------------------------------------------------------------
 
     #region Timestamp Cache (Allocation-Free UTC)
 
@@ -165,10 +153,6 @@ public static class ExLogger
 
     #endregion Timestamp Cache (Allocation-Free UTC)
 
-    // =============================================================================================================
-    // REGION: Object Pool & Exception Formatter
-    // -------------------------------------------------------------------------------------------------------------
-
     #region Object Pool & Exception Formatter
 
     // ♻️ Pool of StringBuilders to reduce allocations when formatting exceptions
@@ -193,10 +177,6 @@ public static class ExLogger
     }
 
     #endregion Object Pool & Exception Formatter
-
-    // =============================================================================================================
-    // REGION: Generic Log Methods
-    // -------------------------------------------------------------------------------------------------------------
 
     #region Generic Log Methods
 
@@ -323,10 +303,6 @@ public static class ExLogger
     }
 
     #endregion Generic Log Methods
-
-    // =============================================================================================================
-    // REGION: Convenience Methods
-    // -------------------------------------------------------------------------------------------------------------
 
     #region Convenience Methods
 
@@ -486,10 +462,6 @@ public static class ExLogger
 
     #endregion Convenience Methods
 
-    // =============================================================================================================
-    // REGION: Exception Logging
-    // -------------------------------------------------------------------------------------------------------------
-
     #region Exception Logging
 
     /// <summary>
@@ -618,10 +590,6 @@ public static class ExLogger
 
     #endregion Exception Logging
 
-    // =============================================================================================================
-    // REGION: Log Scope Helper
-    // -------------------------------------------------------------------------------------------------------------
-
     #region Log Scope Helper
 
     /// <summary>
@@ -703,7 +671,16 @@ public static class ExLogger
 
             public Enumerator(KeyValuePair<string, object> value) => (Current, _moved) = (value, false);
 
-            public bool MoveNext() => !_moved && (_moved = true);
+            public bool MoveNext()
+            {
+                if (_moved)
+                {
+                    return false;
+                }
+
+                _moved = true;
+                return true;
+            }
 
             public KeyValuePair<string, object> Current { get; }
             readonly object IEnumerator.Current => Current;
@@ -816,10 +793,6 @@ public static class ExLogger
 
     #endregion Log Scope Helper
 
-    // =============================================================================================================
-    // REGION: Extensibility Hooks (Async/Batch Ready)
-    // -------------------------------------------------------------------------------------------------------------
-
     #region Extensibility Hooks (Async/Batch Ready)
 
     /// <summary>
@@ -869,9 +842,6 @@ public static class ExLogger
     #endregion Extensibility Hooks (Async/Batch Ready)
 }
 
-// =============================================================================================================
-// REGION: NullScope
-// -------------------------------------------------------------------------------------------------------------
 /// <summary>
 /// Represents a no-op logging scope.
 /// Prevents null reference exceptions when BeginScope() returns null.
