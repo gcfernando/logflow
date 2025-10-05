@@ -1,4 +1,5 @@
 ﻿using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace LogFlow.Core.Batching.Model;
 
@@ -34,6 +35,7 @@ public sealed class BatchFormatOptions
     /// };
     /// </code>
     /// </remarks>
+    [JsonIgnore]
     public JsonSerializerOptions JsonSerializerOptions { get; set; }
 
     /// <summary>
@@ -53,5 +55,6 @@ public sealed class BatchFormatOptions
     ///     $"{DateTime.UtcNow:O} [{entry.Level}] {entry.Message}";
     /// </code>
     /// </remarks>
+    [JsonIgnore]
     public Func<BatchLogEntry, string> TextLineFormatter { get; set; }
 }

@@ -53,10 +53,6 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
     // Background task that drains the channel, batches entries, and triggers flushes.
     private readonly Task _worker;
 
-    // NOTE: _buffer is only touched by the background worker and flush methods
-    // after the worker has been cancelled/awaited. It is NOT thread-safe by design.
-    private List<LogEntry> _buffer = [];
-
     // Lock object used to synchronize flush operations when a custom async sink is configured.
     private readonly object _sync = new();
 
@@ -65,6 +61,12 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
 
     // When OnFlushAsync is not provided, we may build a composite sink from options.
     private readonly Func<IReadOnlyList<BatchLogEntry>, CancellationToken, Task> _composedFlushAsync;
+
+    // NOTE: _buffer is only touched by the background worker and flush methods
+    // after the worker has been cancelled/awaited. It is NOT thread-safe by design.
+    private List<LogEntry> _buffer = [];
+
+    private int _approxQueueLength;
 
     /// <summary>
     /// Exposes counters and timestamps such as dropped entry count and last flush time.
@@ -263,13 +265,23 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
     /// </summary>
     private void Enqueue(LogEntry entry)
     {
-        // If writer is completed or cannot accept more, treat as a drop
+        // Try to write first
         if (_channel.Writer.TryWrite(entry))
         {
+            // Approximate backpressure detection
+            var len = Interlocked.Increment(ref _approxQueueLength);
+
+            // If we are above capacity, a DropOldest likely occurred
+            if (len > _options.Capacity)
+            {
+                Metrics.IncrementDropped();
+                Interlocked.Exchange(ref _approxQueueLength, _options.Capacity);
+            }
+
             return;
         }
 
-        // Either full (DropWrite) or writer already completed — count as drop
+        // If TryWrite failed entirely (writer completed)
         Metrics.IncrementDropped();
     }
 
@@ -295,6 +307,7 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
                 // Drain any available items immediately.
                 while (reader.TryRead(out var entry))
                 {
+                    Interlocked.Decrement(ref _approxQueueLength);
                     _buffer.Add(entry);
 
                     // If we hit the batch size threshold, flush immediately to reduce memory pressure.
@@ -524,7 +537,9 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
             }
 
             // Fallback to synchronous flush to minimize data loss
-            await Task.Run(() => Flush(_buffer), token).ConfigureAwait(false);
+            await Task.Run(() => Flush(snapshot.ConvertAll(
+                e => new LogEntry(e.Level, e.Message, e.Exception, [.. e.Args]))), token)
+            .ConfigureAwait(false);
         }
     }
 
@@ -814,7 +829,7 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
             {
                 RollingInterval.Hour => stamp.ToString("yyyyMMdd_HH", CultureInfo.InvariantCulture),
                 RollingInterval.Day => stamp.ToString("yyyyMMdd", CultureInfo.InvariantCulture),
-                RollingInterval.Week => $"{stamp:yyyyMMdd}-W{CultureInfo.InvariantCulture.Calendar.GetWeekOfYear(stamp, CalendarWeekRule.FirstDay, DayOfWeek.Monday)}",
+                RollingInterval.Week => $"{ISOWeek.GetYear(stamp)}-W{ISOWeek.GetWeekOfYear(stamp):D2}",
                 RollingInterval.Month => stamp.ToString("yyyyMM", CultureInfo.InvariantCulture),
                 RollingInterval.Year => stamp.ToString("yyyy", CultureInfo.InvariantCulture),
                 _ => stamp.ToString("yyyyMMdd", CultureInfo.InvariantCulture)
@@ -960,31 +975,31 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
             dataCommand.CommandText = _opts.GetInsertSql();
 
             var pTs = dataCommand.CreateParameter();
-            pTs.ParameterName = _opts.ColTimestamp;
+            pTs.ParameterName = $"@{_opts.ColTimestamp}";
             _ = dataCommand.Parameters.Add(pTs);
             var pLvl = dataCommand.CreateParameter();
-            pLvl.ParameterName = _opts.ColLevel;
+            pLvl.ParameterName = $"@{_opts.ColLevel}";
             _ = dataCommand.Parameters.Add(pLvl);
             var pMsg = dataCommand.CreateParameter();
-            pMsg.ParameterName = _opts.ColMessage;
+            pMsg.ParameterName = $"@{_opts.ColMessage}";
             _ = dataCommand.Parameters.Add(pMsg);
             var pExc = dataCommand.CreateParameter();
-            pExc.ParameterName = _opts.ColException;
+            pExc.ParameterName = $"@{_opts.ColException}";
             _ = dataCommand.Parameters.Add(pExc);
             var pArgs = dataCommand.CreateParameter();
-            pArgs.ParameterName = _opts.ColArgsJson;
+            pArgs.ParameterName = $"@{_opts.ColArgsJson}";
             _ = dataCommand.Parameters.Add(pArgs);
 
-            foreach (var e in entries)
+            foreach (var entry in entries)
             {
                 token.ThrowIfCancellationRequested();
 
                 pTs.Value = DateTime.UtcNow;
-                pLvl.Value = e.Level.ToString();
-                pMsg.Value = e.Message ?? "";
-                pExc.Value = e.Exception?.ToString() ?? (object)DBNull.Value;
-                pArgs.Value = (e.Args is { Count: > 0 })
-                    ? JsonSerializer.Serialize(e.Args, _fmt.JsonSerializerOptions ?? _defaultJson)
+                pLvl.Value = entry.Level.ToString();
+                pMsg.Value = entry.Message ?? "";
+                pExc.Value = entry.Exception?.ToString() ?? (object)DBNull.Value;
+                pArgs.Value = (entry.Args is { Count: > 0 })
+                    ? JsonSerializer.Serialize(entry.Args, _fmt.JsonSerializerOptions ?? _defaultJson)
                     : DBNull.Value;
 
                 _ = await dataCommand.ExecuteNonQueryAsync(token).ConfigureAwait(false);

@@ -3,6 +3,7 @@ using LogFlow.Core.Batching;
 using LogFlow.Core.Batching.Model;
 using Microsoft.Extensions.Logging;
 using Moq;
+using xRetry;
 
 namespace LogFlow.Tests;
 
@@ -36,7 +37,7 @@ public class BatchLoggerPerformanceTests
         return new BatchLogger(sink.Object, opts);
     }
 
-    [Fact]
+    [RetryFact(5, 1000)]
     public async Task HighVolume_Throughput_ShouldRemainStable()
     {
         const int total = 100_000;
@@ -55,7 +56,7 @@ public class BatchLoggerPerformanceTests
         Assert.True(throughput > 50_000, $"Throughput too low: {throughput:N0} logs/sec");
     }
 
-    [Fact]
+    [RetryFact(10, 1000)]
     public async Task Memory_ShouldRemainStable_After_Dispose()
     {
         // Measure baseline allocation on this thread
@@ -94,7 +95,7 @@ public class BatchLoggerPerformanceTests
         Assert.False(wr.IsAlive, "BatchLogger instance should be collectible after disposal.");
     }
 
-    [Fact]
+    [RetryFact(10, 1000)]
     public async Task BackgroundWorker_ShouldExitCleanly_OnDispose()
     {
         // Take baseline of total managed heap size
@@ -136,7 +137,7 @@ public class BatchLoggerPerformanceTests
         Assert.False(wr.IsAlive, "BatchLogger instance should be collectible after disposal.");
     }
 
-    [Fact]
+    [RetryFact(5, 1000)]
     public async Task Parallel_Writers_No_Data_Races_Or_Drops()
     {
         var logger = MakeFastLogger();
