@@ -8,7 +8,7 @@ using Moq;
 namespace LogFlow.Tests;
 
 /*
- * Developer ::> Gehan Fernando 
+ * Developer ::> Gehan Fernando
  * Date      ::> 2025-10-01
  * Contact   ::> f.gehan@gmail.com / +46 73 701 40 25
 */
@@ -19,6 +19,7 @@ public class BatchLogger_DatabaseSinkTests
     private sealed class FakeDbFactory : DbProviderFactory
     {
         public readonly List<FakeConnection> Connections = [];
+
         public override DbConnection CreateConnection() => new FakeConnection(this);
     }
 
@@ -36,10 +37,15 @@ public class BatchLogger_DatabaseSinkTests
         public override string ServerVersion => "1.0";
         public override ConnectionState State => Opened ? ConnectionState.Open : ConnectionState.Closed;
 
-        public override void ChangeDatabase(string databaseName) { }
+        public override void ChangeDatabase(string databaseName)
+        { }
+
         public override void Close() => Opened = false;
+
         public override void Open() => Opened = true;
-        public override Task OpenAsync(CancellationToken cancellationToken) { Opened = true; return Task.CompletedTask; }
+
+        public override Task OpenAsync(CancellationToken cancellationToken)
+        { Opened = true; return Task.CompletedTask; }
 
         protected override DbTransaction BeginDbTransaction(IsolationLevel isolationLevel) => new FakeTransaction(this);
 
@@ -63,8 +69,12 @@ public class BatchLogger_DatabaseSinkTests
 
         public override IsolationLevel IsolationLevel => IsolationLevel.ReadCommitted;
         protected override DbConnection DbConnection { get; }
-        public override void Commit() { }
-        public override void Rollback() { }
+
+        public override void Commit()
+        { }
+
+        public override void Rollback()
+        { }
     }
 
     private sealed class FakeCommand : DbCommand
@@ -82,14 +92,23 @@ public class BatchLogger_DatabaseSinkTests
         public override bool DesignTimeVisible { get; set; }
         public override UpdateRowSource UpdatedRowSource { get; set; }
 
-        public override void Cancel() { }
+        public override void Cancel()
+        { }
+
         protected override DbParameter CreateDbParameter() => new FakeParameter();
+
         protected override DbDataReader ExecuteDbDataReader(CommandBehavior behavior) => throw new NotImplementedException();
+
         public override int ExecuteNonQuery() => 1;
+
         public override Task<int> ExecuteNonQueryAsync(CancellationToken cancellationToken) => Task.FromResult(1);
+
         public override object ExecuteScalar() => 1;
+
         public override Task<object> ExecuteScalarAsync(CancellationToken cancellationToken) => Task.FromResult<object>(1);
-        public override void Prepare() { }
+
+        public override void Prepare()
+        { }
     }
 
     private sealed class FakeParameter : DbParameter
@@ -102,13 +121,18 @@ public class BatchLogger_DatabaseSinkTests
         public override object Value { get; set; } = string.Empty;
         public override bool SourceColumnNullMapping { get; set; }
         public override int Size { get; set; }
-        public override void ResetDbType() { }
+
+        public override void ResetDbType()
+        { }
     }
 
     private sealed class FakeParamCollection : DbParameterCollection
     {
         private readonly List<DbParameter> _list = [];
-        public override int Add(object value) { _list.Add((DbParameter)value); return _list.Count - 1; }
+
+        public override int Add(object value)
+        { _list.Add((DbParameter)value); return _list.Count - 1; }
+
         public override void AddRange(Array values)
         {
             foreach (var v in values)
@@ -116,22 +140,37 @@ public class BatchLogger_DatabaseSinkTests
                 _ = Add(v);
             }
         }
+
         public override void Clear() => _list.Clear();
+
         public override bool Contains(object value) => _list.Contains((DbParameter)value);
+
         public override bool Contains(string value) => _list.Any(p => p.ParameterName == value);
+
         public override void CopyTo(Array array, int index) => _list.ToArray().CopyTo(array, index);
+
         public override int Count => _list.Count;
+
         public override System.Collections.IEnumerator GetEnumerator() => _list.GetEnumerator();
+
         protected override DbParameter GetParameter(int index) => _list[index];
+
         protected override DbParameter GetParameter(string parameterName) => _list.FirstOrDefault(p => p.ParameterName == parameterName);
+
         public override int IndexOf(object value) => _list.IndexOf((DbParameter)value);
+
         public override int IndexOf(string parameterName) => _list.FindIndex(p => p.ParameterName == parameterName);
+
         public override void Insert(int index, object value) => _list.Insert(index, (DbParameter)value);
+
         public override bool IsFixedSize => false;
         public override bool IsReadOnly => false;
         public override bool IsSynchronized => false;
+
         public override void Remove(object value) => _list.Remove((DbParameter)value);
+
         public override void RemoveAt(int index) => _list.RemoveAt(index);
+
         public override void RemoveAt(string parameterName)
         {
             var i = IndexOf(parameterName);
@@ -140,7 +179,9 @@ public class BatchLogger_DatabaseSinkTests
                 _list.RemoveAt(i);
             }
         }
+
         protected override void SetParameter(int index, DbParameter value) => _list[index] = value;
+
         protected override void SetParameter(string parameterName, DbParameter value)
         {
             var i = IndexOf(parameterName);
@@ -153,13 +194,13 @@ public class BatchLogger_DatabaseSinkTests
                 _ = Add(value);
             }
         }
+
         public override object SyncRoot => this;
     }
 
     private const string _providerName = "LogFlow.Tests.FakeDb";
 
     static BatchLogger_DatabaseSinkTests() =>
-        // Register our fake factory once
         DbProviderFactories.RegisterFactory(_providerName, new FakeDbFactory());
 
     private static BatchLogger MakeDbLogger(out FakeDbFactory factory)

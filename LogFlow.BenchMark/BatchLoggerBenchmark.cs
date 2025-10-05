@@ -6,6 +6,7 @@ using LogFlow.Core.Batching.Model;
 using LogFlow.Core.Batching.Model.Enums;
 using LogFlow.Core.ExLogging;
 using Microsoft.Extensions.Logging;
+
 namespace LogFlow.BenchMark;
 
 [CategoriesColumn, GroupBenchmarksBy(BenchmarkLogicalGroupRule.ByCategory)]
@@ -202,7 +203,7 @@ public class BatchLoggerBenchmarks
             Capacity = 200_000,
             BatchSize = 1024,
             FlushInterval = TimeSpan.FromSeconds(10),
-            ForwardToILoggerSink = false, // keep it pure enqueue cost + minimal flush cost
+            ForwardToILoggerSink = false,
             OnFlushAsync = NoOpFlush.RunAsync
         });
 
@@ -240,7 +241,7 @@ public class BatchLoggerBenchmarks
                 Path = td.Combine("roll.log"),
                 Format = BatchFileFormat.Text,
                 RollingInterval = RollingInterval.None,
-                RollingSizeBytes = 8 * 1024, // 8KB (very small to force rolling)
+                RollingSizeBytes = 8 * 1024,
                 RetainedFileCountLimit = 3
             }
         };

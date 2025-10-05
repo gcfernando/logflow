@@ -9,10 +9,11 @@ using Microsoft.Extensions.ObjectPool;
 namespace LogFlow.Core.ExLogging;
 
 /*
- * Developer ::> Gehan Fernando 
+ * Developer ::> Gehan Fernando
  * Date      ::> 2025-10-01
  * Contact   ::> f.gehan@gmail.com / + 46 73 701 40 25
 */
+
 public static class ExLogger
 {
     static ExLogger()
@@ -385,6 +386,7 @@ public static class ExLogger
     #endregion Convenience Methods
 
     #region Exception Logging
+
     public static void ExLogErrorException(this ILogger logger, Exception ex, string title = "System Error", bool moreDetailsEnabled = false)
     {
         ArgumentNullException.ThrowIfNull(logger);
@@ -605,7 +607,6 @@ public static class ExLogger
 
         public override string ToString()
         {
-            // Avoid LINQ/Join to minimize allocs in rare ToString paths
             if (_items.Count == 0)
             {
                 return string.Empty;
@@ -685,8 +686,11 @@ public static class ExLogger
     private sealed class DisposableScope : IDisposable
     {
         private readonly object _state;
+
         public DisposableScope(object state) => _state = state;
-        public void Dispose() { }
+
+        public void Dispose()
+        { }
 
         public override string ToString() => _state.ToString() ?? string.Empty;
     }
@@ -696,8 +700,10 @@ public static class ExLogger
     #region Extensibility Hooks (Async/Batch Ready)
 
     public static Func<LogLevel, string, Exception, bool> AsyncSinkFilter { get; private set; } = static (_, _, _) => true;
+
     public static void UseAsyncSinkProvider(Func<LogLevel, string, Exception, bool> filter)
         => AsyncSinkFilter = filter ?? AsyncSinkFilter;
+
     public static async Task FlushAsync(CancellationToken cancellationToken = default)
     {
         try

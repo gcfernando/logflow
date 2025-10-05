@@ -1,6 +1,5 @@
 ﻿using System.Data.Common;
 using System.Globalization;
-using System.Linq;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Channels;
@@ -12,7 +11,7 @@ using Microsoft.Extensions.Logging;
 namespace LogFlow.Core.Batching;
 
 /*
- * Developer ::> Gehan Fernando 
+ * Developer ::> Gehan Fernando
  * Date      ::> 2025-10-01
  * Contact   ::> f.gehan@gmail.com / + 46 73 701 40 25
 */
@@ -91,12 +90,19 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
     }
 
     public void ExLogTrace(string msg, params object[] args) => LogInternal(LogLevel.Trace, msg, null, args);
+
     public void ExLogDebug(string msg, params object[] args) => LogInternal(LogLevel.Debug, msg, null, args);
+
     public void ExLogInformation(string msg, params object[] args) => LogInternal(LogLevel.Information, msg, null, args);
+
     public void ExLogWarning(string msg, params object[] args) => LogInternal(LogLevel.Warning, msg, null, args);
+
     public void ExLogError(string msg, params object[] args) => LogInternal(LogLevel.Error, msg, null, args);
+
     public void ExLogError(string msg, Exception ex, params object[] args) => LogInternal(LogLevel.Error, msg, ex, args);
+
     public void ExLogCritical(string msg, params object[] args) => LogInternal(LogLevel.Critical, msg, null, args);
+
     public void ExLogCritical(string msg, Exception ex, params object[] args) => LogInternal(LogLevel.Critical, msg, ex, args);
 
     public void ExLogErrorException(Exception ex, string title = "System Error", bool details = false)
@@ -162,7 +168,7 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
             var len = Interlocked.Increment(ref _approxQueueLength);
             if (len > _options.Capacity)
             {
-                Interlocked.Exchange(ref _approxQueueLength, _options.Capacity);
+                _ = Interlocked.Exchange(ref _approxQueueLength, _options.Capacity);
             }
         }
         else
@@ -187,7 +193,7 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
 
                 while (reader.TryRead(out var entry))
                 {
-                    Interlocked.Decrement(ref _approxQueueLength);
+                    _ = Interlocked.Decrement(ref _approxQueueLength);
                     _buffer.Add(entry);
 
                     if (_buffer.Count >= batchSize)
@@ -559,6 +565,7 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
     private sealed class ForwardingBatchSink : IBatchSink
     {
         private readonly ILogger _sink;
+
         public ForwardingBatchSink(ILogger sink) => _sink = sink;
 
         public Task WriteAsync(IReadOnlyList<BatchLogEntry> entries, CancellationToken token)

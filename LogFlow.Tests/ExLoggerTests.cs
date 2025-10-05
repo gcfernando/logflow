@@ -6,7 +6,7 @@ using Moq;
 namespace LogFlow.Tests;
 
 /*
- * Developer ::> Gehan Fernando 
+ * Developer ::> Gehan Fernando
  * Date      ::> 2025-10-01
  * Contact   ::> f.gehan@gmail.com / + 46 73 701 40 25
 */
@@ -113,10 +113,8 @@ public class ExLoggerTests
     [Fact]
     public void ExLogInformation_Calls_LogNoArgs_WhenNoArgs()
     {
-        // Act
         _mockLogger.Object.ExLogInformation("Simple info");
 
-        // Assert
         _mockLogger.Verify(l => l.Log(
             LogLevel.Information,
             It.IsAny<EventId>(),

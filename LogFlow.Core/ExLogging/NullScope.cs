@@ -1,10 +1,11 @@
 ﻿namespace LogFlow.Core.ExLogging;
 
 /*
- * Developer ::> Gehan Fernando 
+ * Developer ::> Gehan Fernando
  * Date      ::> 2025-10-01
  * Contact   ::> f.gehan@gmail.com / + 46 73 701 40 25
 */
+
 internal sealed class NullScope : IDisposable
 {
     public static readonly NullScope Instance = new();

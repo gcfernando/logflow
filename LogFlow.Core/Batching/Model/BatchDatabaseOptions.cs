@@ -1,10 +1,11 @@
 ﻿namespace LogFlow.Core.Batching.Model;
 
 /*
- * Developer ::> Gehan Fernando 
+ * Developer ::> Gehan Fernando
  * Date      ::> 2025-10-01
  * Contact   ::> f.gehan@gmail.com / + 46 73 701 40 25
 */
+
 public sealed class BatchDatabaseOptions
 {
     public bool Enabled { get; set; }
@@ -17,6 +18,7 @@ public sealed class BatchDatabaseOptions
     public string ColMessage { get; set; } = "Message";
     public string ColException { get; set; } = "Exception";
     public string ColArgsJson { get; set; } = "ArgsJson";
+
     internal string GetCreateTableSql()
     {
         // Generic SQL; providers may tweak types with implicit conversions.
