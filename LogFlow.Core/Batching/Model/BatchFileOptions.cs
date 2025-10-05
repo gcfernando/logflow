@@ -14,7 +14,7 @@ public sealed class BatchFileOptions
     public bool Enabled { get; set; }
 
     [Required]
-    public string Path { get; set; } = "logs/log.txt";
+    public string Path { get; set; } = $"logs/log_{Guid.NewGuid():N}.txt";
 
     public BatchFileFormat Format { get; set; } = BatchFileFormat.Text;
     public RollingInterval RollingInterval { get; set; } = RollingInterval.Day;

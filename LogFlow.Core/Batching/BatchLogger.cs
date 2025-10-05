@@ -1,4 +1,5 @@
-﻿using System.Data.Common;
+﻿using System.Buffers;
+using System.Data.Common;
 using System.Globalization;
 using System.Text;
 using System.Text.Json;
@@ -24,14 +25,18 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
     private readonly Task _worker;
     private readonly object _sync = new();
     private readonly BatchLoggerOptions _options;
-    private readonly Func<IReadOnlyList<BatchLogEntry>, CancellationToken, Task> _composedFlushAsync;
-    private List<LogEntry> _buffer = [];
+    private LogEntry[] _bufferArray;
+    private int _bufferCount;
     private int _approxQueueLength;
+
+    private readonly List<LogEntry> _buffer = [];
+    private readonly Func<IReadOnlyList<BatchLogEntry>, CancellationToken, Task> _composedFlushAsync;
+    private readonly ArrayPool<LogEntry> _entryPool = ArrayPool<LogEntry>.Shared;
 
     public BatchLoggerMetrics Metrics { get; } = new();
     public Func<Exception, string, bool, string> ExceptionFormatter { get; set; } = ExLogger.ExceptionFormatter;
 
-    public BatchLogger(ILogger sink, BatchLoggerOptions options = null)
+    public BatchLogger(ILogger sink, BatchLoggerOptions options = null, bool disableBackgroundWorker = false)
     {
         _sink = sink ?? throw new ArgumentNullException(nameof(sink));
         _options = options ?? new BatchLoggerOptions();
@@ -48,7 +53,13 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
 
         _composedFlushAsync = BuildComposedFlushIfNeeded(_options, _sink);
 
-        _worker = Task.Run(() => ProcessAsync(_cts.Token), _cts.Token);
+        if (!disableBackgroundWorker)
+        {
+            _worker = Task.Run(() => ProcessAsync(_cts.Token), _cts.Token);
+        }
+
+        _bufferArray = _entryPool.Rent(_options.BatchSize);
+        _bufferCount = 0;
     }
 
     public bool IsEnabled(LogLevel logLevel) => _sink.IsEnabled(logLevel);
@@ -67,18 +78,17 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
         var msg = formatter != null ? formatter(state, exception) : state?.ToString() ?? "N/A";
 
         var args = Array.Empty<object>();
+
         if (state is IEnumerable<KeyValuePair<string, object>> kvPairs)
         {
-            var list = new List<object>(8);
+            List<object> list = null;
             foreach (var kv in kvPairs)
             {
+                list ??= new(8);
                 list.Add(kv.Value ?? "N/A");
             }
 
-            if (list.Count > 0)
-            {
-                args = [.. list];
-            }
+            args = list?.ToArray() ?? Array.Empty<object>();
         }
 
         if (_options.Filter != null && !_options.Filter(logLevel, msg, exception, args))
@@ -157,19 +167,9 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
 
     private void Enqueue(LogEntry entry)
     {
-        if (_options.ChannelFullMode == BoundedChannelFullMode.DropOldest &&
-            _approxQueueLength >= _options.Capacity)
-        {
-            Metrics.IncrementDropped();
-        }
-
         if (_channel.Writer.TryWrite(entry))
         {
-            var len = Interlocked.Increment(ref _approxQueueLength);
-            if (len > _options.Capacity)
-            {
-                _ = Interlocked.Exchange(ref _approxQueueLength, _options.Capacity);
-            }
+            Interlocked.Increment(ref _approxQueueLength);
         }
         else
         {
@@ -182,35 +182,39 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
         var reader = _channel.Reader;
         var flushInterval = _options.FlushInterval;
         var batchSize = _options.BatchSize;
+        var nextFlush = DateTime.UtcNow + flushInterval;
 
         try
         {
             while (!token.IsCancellationRequested)
             {
-                var delayTask = Task.Delay(flushInterval, token);
-                var readTask = reader.WaitToReadAsync(token).AsTask();
-                var completed = await Task.WhenAny(readTask, delayTask).ConfigureAwait(false);
-
-                while (reader.TryRead(out var entry))
+                if (await reader.WaitToReadAsync(token).ConfigureAwait(false))
                 {
-                    _ = Interlocked.Decrement(ref _approxQueueLength);
-                    _buffer.Add(entry);
-
-                    if (_buffer.Count >= batchSize)
+                    while (reader.TryRead(out var entry))
                     {
-                        await FlushAsync(token).ConfigureAwait(false);
+                        _buffer.Add(entry);
+                        Interlocked.Decrement(ref _approxQueueLength);
+
+                        if (_buffer.Count >= batchSize)
+                        {
+                            await FlushAsync(token).ConfigureAwait(false);
+                            nextFlush = DateTime.UtcNow + flushInterval;
+                        }
                     }
                 }
 
-                if (_buffer.Count > 0 && completed == delayTask)
+                if (_buffer.Count > 0 && DateTime.UtcNow >= nextFlush)
                 {
                     await FlushAsync(token).ConfigureAwait(false);
+                    nextFlush = DateTime.UtcNow + flushInterval;
                 }
+
+                await Task.Yield();
             }
         }
         catch (OperationCanceledException)
         {
-            // Expected on shutdown; no action needed.
+            // Expected on shutdown
         }
         catch (Exception ex)
         {
@@ -220,7 +224,7 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
             }
             catch
             {
-                // Swallow if the sink itself is failing.
+                // ignore sink failure
             }
 
             try
@@ -229,7 +233,7 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
             }
             catch
             {
-                // Never allow diagnostics to crash the worker.
+                // ignore secondary
             }
         }
 
@@ -284,17 +288,32 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
 
         while (_channel.Reader.TryRead(out var entry))
         {
-            _buffer.Add(entry);
+            if (_bufferCount >= _bufferArray.Length)
+            {
+                // Expand pooled array when necessary
+                var newArray = _entryPool.Rent(_bufferArray.Length * 2);
+                Array.Copy(_bufferArray, newArray, _bufferArray.Length);
+                _entryPool.Return(_bufferArray);
+                _bufferArray = newArray;
+            }
+            _bufferArray[_bufferCount++] = entry;
         }
 
-        var toFlush = Interlocked.Exchange(ref _buffer, new List<LogEntry>(_options.BatchSize));
-
-        if (toFlush.Count == 0)
+        if (_bufferCount == 0)
         {
             return;
         }
 
-        var snapshot = toFlush.ConvertAll(e => new BatchLogEntry(e.Level, e.Message, e.Exception, e.Args));
+        var count = _bufferCount;
+        _bufferCount = 0;
+
+        var snapshot = new BatchLogEntry[count];
+        for (var i = 0; i < count; i++)
+        {
+            var e = _bufferArray[i];
+            snapshot[i] = new BatchLogEntry(e.Level, e.Message, e.Exception, e.Args);
+            _bufferArray[i] = default; // clear slot for reuse
+        }
 
         try
         {
@@ -308,13 +327,14 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
             }
             else
             {
-                foreach (var e in toFlush)
+                for (var i = 0; i < count; i++)
                 {
+                    var e = snapshot[i];
                     ExLogger.Log(_sink, e.Level, e.Message, e.Exception, e.Args);
                 }
             }
 
-            Metrics.AddFlushed(snapshot.Count);
+            Metrics.AddFlushed(snapshot.Length);
             Metrics.SetLastFlush(DateTime.UtcNow);
         }
         catch (OperationCanceledException)
@@ -426,16 +446,21 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
     {
         try
         {
-            _ = _channel.Writer.TryComplete();
-            _cts.Cancel();
-
-            try
+            if (!_cts.IsCancellationRequested)
             {
-                _worker.GetAwaiter().GetResult();
+                _cts.Cancel();
             }
-            catch (OperationCanceledException)
+
+            _channel.Writer.TryComplete();
+
+            if (_worker?.IsCompleted == false)
             {
-                // Expected when cancellation is cooperative.
+                try
+                { _worker.GetAwaiter().GetResult(); }
+                catch (OperationCanceledException)
+                {
+                    // Expected when cancellation is cooperative.
+                }
             }
 
             while (_channel.Reader.TryRead(out var e))
@@ -445,22 +470,25 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
 
             if (_buffer.Count > 0)
             {
-                if (_options.OnFlushAsync is not null || _composedFlushAsync is not null)
+                try
                 {
-                    try
+                    if (_options.OnFlushAsync is not null || _composedFlushAsync is not null)
                     {
                         FlushViaCustomSinkAsync(CancellationToken.None).GetAwaiter().GetResult();
                     }
-                    catch (Exception ex)
+                    else
                     {
-                        try
-                        { _options.OnInternalError?.Invoke("BatchLogger Dispose flush error", ex); }
-                        catch { /* ignore */ }
                         Flush(_buffer);
                     }
                 }
-                else
+                catch (Exception ex)
                 {
+                    try
+                    {
+                        _options.OnInternalError?.Invoke("BatchLogger Dispose flush error", ex);
+                    }
+                    catch { /* ignore secondary error */ }
+
                     Flush(_buffer);
                 }
             }
@@ -610,17 +638,38 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
             await using var stream = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite, 4096, useAsync: true);
             await using var writer = new StreamWriter(stream, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
 
-            foreach (var e in entries)
+            if (_opts.Format == BatchFileFormat.Json)
             {
-                token.ThrowIfCancellationRequested();
+                var batchPayload = entries.Select(e => new
+                {
+                    tsUtc = _fmt.UsePerEntryTimestamp ? DateTime.UtcNow : batchTimestamp,
+                    level = e.Level.ToString(),
+                    message = e.Message,
+                    exception = e.Exception?.ToString(),
+                    args = e.Args
+                });
 
-                var dateTime = _fmt.UsePerEntryTimestamp ? DateTime.UtcNow : batchTimestamp;
+                var json = JsonSerializer.Serialize(
+                    batchPayload,
+                    _fmt.JsonSerializerOptions ?? _defaultJson
+                );
 
-                var line = Format(e, _fmt, _opts.Format, dateTime);
-                await writer.WriteLineAsync(line.AsMemory(), token).ConfigureAwait(false);
+                await writer.WriteLineAsync(json.AsMemory(), token).ConfigureAwait(false);
+            }
+            else
+            {
+                foreach (var e in entries)
+                {
+                    token.ThrowIfCancellationRequested();
+
+                    var dateTime = _fmt.UsePerEntryTimestamp ? DateTime.UtcNow : batchTimestamp;
+                    var line = Format(e, _fmt, _opts.Format, dateTime);
+                    await writer.WriteLineAsync(line.AsMemory(), token).ConfigureAwait(false);
+                }
             }
 
             await writer.FlushAsync(token).ConfigureAwait(false);
+            await stream.FlushAsync(token).ConfigureAwait(false);
         }
 
         private string GetCurrentPath()
@@ -649,13 +698,43 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
 
         private void RollFiles()
         {
-            var path = GetCurrentPath();
-            if (!File.Exists(path))
+            try
             {
-                return;
+                var path = GetCurrentPath();
+                if (!File.Exists(path))
+                {
+                    return;
+                }
+
+                _ = Task.Run(() =>
+                {
+                    try
+                    {
+                        for (var i = _opts.RetainedFileCountLimit - 1; i >= 1; i--)
+                        {
+                            var older = $"{path}.{i}";
+                            var newer = $"{path}.{i + 1}";
+
+                            if (File.Exists(older))
+                            {
+                                TryMove(older, newer);
+                            }
+                        }
+
+                        TryMove(path, $"{path}.1");
+                    }
+                    catch
+                    {
+                        // Ignore secondary failures to avoid blocking writes
+                    }
+                });
+            }
+            catch
+            {
+                // Ignore to keep logging resilient
             }
 
-            static void SafeMove(string src, string dst)
+            static void TryMove(string src, string dst)
             {
                 try
                 {
@@ -664,20 +743,15 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
                         File.Move(src, dst, overwrite: true);
                     }
                 }
+                catch (IOException)
+                {
+                    // File might still be in use; skip silently
+                }
                 catch
                 {
-                    // Ignore rolling failures to avoid blocking logging.
+                    // Ignore unexpected errors
                 }
             }
-
-            for (var i = _opts.RetainedFileCountLimit - 1; i >= 1; i--)
-            {
-                var older = $"{path}.{i}";
-                var newer = $"{path}.{i + 1}";
-                SafeMove(older, newer);
-            }
-
-            SafeMove(path, $"{path}.1");
         }
 
         private static string Format(BatchLogEntry e, BatchFormatOptions fmt, BatchFileFormat fileFormat, DateTime now)
@@ -739,8 +813,12 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
 
         public async Task WriteAsync(IReadOnlyList<BatchLogEntry> entries, CancellationToken token)
         {
-            var factory = DbProviderFactories.GetFactory(_opts.ProviderInvariantName);
+            if (entries.Count == 0)
+            {
+                return;
+            }
 
+            var factory = DbProviderFactories.GetFactory(_opts.ProviderInvariantName);
             await using var conn = factory.CreateConnection()!;
             conn.ConnectionString = _opts.ConnectionString;
             await conn.OpenAsync(token).ConfigureAwait(false);
@@ -755,51 +833,72 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
                 }
                 catch
                 {
-                    // Ignore table creation race conditions (e.g., table already exists)
+                    // Ignore "table already exists" race
                 }
             }
 
-            await using var dataCommand = conn.CreateCommand();
-            dataCommand.CommandText = _opts.GetInsertSql();
-
-            static string P(string name) => name.Length > 0 && name[0] == '@' ? name : $"@{name}";
-
-            var pTs = dataCommand.CreateParameter();
-            pTs.ParameterName = P(_opts.ColTimestamp);
-            _ = dataCommand.Parameters.Add(pTs);
-
-            var pLvl = dataCommand.CreateParameter();
-            pLvl.ParameterName = P(_opts.ColLevel);
-            _ = dataCommand.Parameters.Add(pLvl);
-
-            var pMsg = dataCommand.CreateParameter();
-            pMsg.ParameterName = P(_opts.ColMessage);
-            _ = dataCommand.Parameters.Add(pMsg);
-
-            var pExc = dataCommand.CreateParameter();
-            pExc.ParameterName = P(_opts.ColException);
-            _ = dataCommand.Parameters.Add(pExc);
-
-            var pArgs = dataCommand.CreateParameter();
-            pArgs.ParameterName = P(_opts.ColArgsJson);
-            _ = dataCommand.Parameters.Add(pArgs);
-
+            // ---------- Optimized multi-row INSERT ----------
             var jsonOpts = _fmt.JsonSerializerOptions ?? _defaultJson;
+            var table = _opts.Table;
 
-            foreach (var entry in entries)
+            var sb = new StringBuilder(entries.Count * 256);
+            sb.Append("INSERT INTO ")
+              .Append(table)
+              .Append(" (")
+              .Append(_opts.ColTimestamp).Append(", ")
+              .Append(_opts.ColLevel).Append(", ")
+              .Append(_opts.ColMessage).Append(", ")
+              .Append(_opts.ColException).Append(", ")
+              .Append(_opts.ColArgsJson)
+              .Append(") VALUES ");
+
+            for (var i = 0; i < entries.Count; i++)
             {
-                token.ThrowIfCancellationRequested();
+                if (i > 0)
+                {
+                    sb.Append(',');
+                }
 
+                sb.AppendFormat(CultureInfo.InvariantCulture,
+                    "(@pTs{0}, @pLvl{0}, @pMsg{0}, @pExc{0}, @pArgs{0})", i);
+            }
+
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = sb.ToString();
+
+            for (var i = 0; i < entries.Count; i++)
+            {
+                var e = entries[i];
+                var pTs = cmd.CreateParameter();
+                pTs.ParameterName = $"@pTs{i}";
                 pTs.Value = DateTime.UtcNow;
-                pLvl.Value = entry.Level.ToString();
-                pMsg.Value = entry.Message ?? string.Empty;
-                pExc.Value = entry.Exception?.ToString() ?? (object)DBNull.Value;
-                pArgs.Value = (entry.Args is { Count: > 0 })
-                    ? JsonSerializer.Serialize(entry.Args, jsonOpts)
+
+                var pLvl = cmd.CreateParameter();
+                pLvl.ParameterName = $"@pLvl{i}";
+                pLvl.Value = e.Level.ToString();
+
+                var pMsg = cmd.CreateParameter();
+                pMsg.ParameterName = $"@pMsg{i}";
+                pMsg.Value = e.Message ?? string.Empty;
+
+                var pExc = cmd.CreateParameter();
+                pExc.ParameterName = $"@pExc{i}";
+                pExc.Value = e.Exception?.ToString() ?? (object)DBNull.Value;
+
+                var pArgs = cmd.CreateParameter();
+                pArgs.ParameterName = $"@pArgs{i}";
+                pArgs.Value = (e.Args is { Count: > 0 })
+                    ? JsonSerializer.Serialize(e.Args, jsonOpts)
                     : DBNull.Value;
 
-                _ = await dataCommand.ExecuteNonQueryAsync(token).ConfigureAwait(false);
+                _ = cmd.Parameters.Add(pTs);
+                _ = cmd.Parameters.Add(pLvl);
+                _ = cmd.Parameters.Add(pMsg);
+                _ = cmd.Parameters.Add(pExc);
+                _ = cmd.Parameters.Add(pArgs);
             }
+
+            _ = await cmd.ExecuteNonQueryAsync(token).ConfigureAwait(false);
         }
     }
 }

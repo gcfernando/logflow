@@ -45,13 +45,13 @@ public class BatchLoggerBenchmarks
             Capacity = 100_000,
             BatchSize = 512,
             FlushInterval = TimeSpan.FromMilliseconds(250),
-            ForwardToILoggerSink = true,
+            ForwardToILoggerSink = false,
             File = new BatchFileOptions
             {
                 Enabled = false
             },
             Database = new BatchDatabaseOptions { Enabled = false }
-        });
+        }, disableBackgroundWorker: true);
 
         _batchNoForward = new BatchLogger(_downstream, new BatchLoggerOptions
         {
@@ -68,7 +68,7 @@ public class BatchLoggerBenchmarks
                 RollingSizeBytes = 0
             },
             Database = new BatchDatabaseOptions { Enabled = false }
-        });
+        }, disableBackgroundWorker: true);
 
         _batch.ExLogInformation("warmup");
         _batchNoForward.ExLogInformation("warmup");
@@ -110,8 +110,9 @@ public class BatchLoggerBenchmarks
             Capacity = 100_000,
             BatchSize = 512,
             FlushInterval = TimeSpan.FromSeconds(5),
-            Filter = (lvl, _, __, ___) => lvl >= LogLevel.Information
-        });
+            Filter = (lvl, _, __, ___) => lvl >= LogLevel.Information,
+            Database = new BatchDatabaseOptions { Enabled = false }
+        }, disableBackgroundWorker: true);
 
         for (var i = 0; i < N; i++)
         {
@@ -159,8 +160,9 @@ public class BatchLoggerBenchmarks
                 Path = td.Combine("app.jsonl"),
                 Format = BatchFileFormat.Json,
                 RollingInterval = RollingInterval.None
-            }
-        });
+            },
+            Database = new BatchDatabaseOptions { Enabled = false }
+        }, disableBackgroundWorker: true);
 
         for (var i = 0; i < N; i++)
         {
@@ -181,7 +183,7 @@ public class BatchLoggerBenchmarks
             FlushInterval = TimeSpan.FromSeconds(5),
             OnFlushAsync = NoOpFlush.RunAsync,
             ForwardToILoggerSink = false
-        });
+        }, disableBackgroundWorker: true);
 
         for (var i = 0; i < N; i++)
         {
@@ -204,8 +206,9 @@ public class BatchLoggerBenchmarks
             BatchSize = 1024,
             FlushInterval = TimeSpan.FromSeconds(10),
             ForwardToILoggerSink = false,
-            OnFlushAsync = NoOpFlush.RunAsync
-        });
+            OnFlushAsync = NoOpFlush.RunAsync,
+            Database = new BatchDatabaseOptions { Enabled = false }
+        }, disableBackgroundWorker: true);
 
         var perWriter = N / Writers;
         var tasks = new Task[Writers];
@@ -243,10 +246,11 @@ public class BatchLoggerBenchmarks
                 RollingInterval = RollingInterval.None,
                 RollingSizeBytes = 8 * 1024,
                 RetainedFileCountLimit = 3
-            }
+            },
+            Database = new BatchDatabaseOptions { Enabled = false }
         };
 
-        var batch = new BatchLogger(_downstream, opts);
+        var batch = new BatchLogger(_downstream, opts, disableBackgroundWorker: true);
 
         for (var i = 0; i < N; i++)
         {
