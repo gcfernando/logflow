@@ -16,8 +16,6 @@ namespace LogFlow.Tests;
 [Collection("Non-Parallel BatchLogger DB")]
 public class BatchLogger_DatabaseSinkTests
 {
-    // --- Minimal in-memory fake provider ---
-
     private sealed class FakeDbFactory : DbProviderFactory
     {
         public readonly List<FakeConnection> Connections = [];
@@ -43,7 +41,6 @@ public class BatchLogger_DatabaseSinkTests
         public override void Open() => Opened = true;
         public override Task OpenAsync(CancellationToken cancellationToken) { Opened = true; return Task.CompletedTask; }
 
-        // ✅ Added implementation required by abstract DbConnection
         protected override DbTransaction BeginDbTransaction(IsolationLevel isolationLevel) => new FakeTransaction(this);
 
         protected override DbCommand CreateDbCommand()
@@ -78,7 +75,6 @@ public class BatchLogger_DatabaseSinkTests
         public override int CommandTimeout { get; set; }
         public override CommandType CommandType { get; set; }
 
-        // ✅ Implemented full getter/setter for DbConnection
         protected override DbConnection DbConnection { get; set; }
 
         protected override DbParameterCollection DbParameterCollection { get; } = new FakeParamCollection();
@@ -198,12 +194,10 @@ public class BatchLogger_DatabaseSinkTests
         logger.ExLogError("oops", new InvalidOperationException("boom"));
         await logger.FlushAsync();
 
-        // One connection created, several commands executed
         Assert.NotEmpty(factory.Connections);
         var conn = factory.Connections[^1];
-        Assert.True(conn.Opened); // got opened at some point
+        Assert.True(conn.Opened);
 
-        // Expect at least one CREATE TABLE and two INSERTS
         var createCmd = conn.Commands.FirstOrDefault(c => (c.CommandText ?? "").Contains("CREATE TABLE", StringComparison.OrdinalIgnoreCase));
         Assert.NotNull(createCmd);
 
@@ -245,7 +239,6 @@ public class BatchLogger_DatabaseSinkTests
         logger.ExLogInformation("hi");
         await logger.FlushAsync();
 
-        // Should still insert, but without CREATE TABLE
         var factory = (FakeDbFactory)DbProviderFactories.GetFactory(_providerName);
         var conn = factory.Connections[^1];
         Assert.DoesNotContain(conn.Commands, c => (c.CommandText ?? "").Contains("CREATE TABLE", StringComparison.OrdinalIgnoreCase));

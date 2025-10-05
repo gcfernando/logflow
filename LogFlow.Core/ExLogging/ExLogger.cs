@@ -13,36 +13,15 @@ namespace LogFlow.Core.ExLogging;
  * Date      ::> 2025-10-01
  * Contact   ::> f.gehan@gmail.com / + 46 73 701 40 25
 */
-
-/// <summary>
-/// ExLogger: A high-performance static logging helper for .NET applications.
-/// <para>
-/// ⚡ Optimized for throughput and low allocations, built on top of <see cref="ILogger"/>.
-/// </para>
-/// Features:
-/// - Predefined logging delegates for each <see cref="LogLevel"/> (avoids allocations from string formatting).
-/// - Cached <see cref="EventId"/> values to avoid runtime allocation.
-/// - Structured logging support with {Placeholders}.
-/// - Exception logging with configurable formatting (stack trace, inner exceptions).
-/// - Scope support for contextual logging (single or multiple key-value pairs).
-/// - Uses <see cref="ObjectPool{T}"/> to reuse <see cref="StringBuilder"/> for exception messages.
-/// - Cached, allocation-free UTC timestamp formatting for exception logs.
-/// - Shutdown() to dispose timer safely in dynamic environments (tests/plugins).
-/// </summary>
 public static class ExLogger
 {
-    // Static constructor to hook into process exit
     static ExLogger()
     {
-        // Ensure graceful cleanup during AppDomain unload or process exit
         AppDomain.CurrentDomain.ProcessExit += static (_, __) => SafeShutdown();
         AppDomain.CurrentDomain.DomainUnload += static (_, __) => SafeShutdown();
     }
 
     #region Predefined Delegates for Performance
-
-    // NOTE: Delegates now use Exception? to reflect that null is valid, avoiding null-suppression warnings.
-    // These delegates are allocation-free and extremely fast when no args are provided (fast-path).
 
     private static readonly Action<ILogger, string, Exception> _trace =
         LoggerMessage.Define<string>(LogLevel.Trace, new EventId(0, "TraceEvent"), "{Message}");
@@ -62,20 +41,17 @@ public static class ExLogger
     private static readonly Action<ILogger, string, Exception> _critical =
         LoggerMessage.Define<string>(LogLevel.Critical, new EventId(5, "CriticalEvent"), "{Message}");
 
-    // No-op for LogLevel.None (index = 6)
     private static readonly Action<ILogger, string, Exception> _noop = static (_, __, ___) => { };
 
-    // 🔒 Fixed array lookup (cheaper than Dictionary)
-    // LogLevel enum numeric values: Trace=0..Critical=5, None=6
     private static readonly Action<ILogger, string, Exception>[] _byLevel =
     [
-        _trace,    // 0
-        _debug,    // 1
-        _info,     // 2
-        _warn,     // 3
-        _error,    // 4
-        _critical, // 5
-        _noop      // 6 (None)
+        _trace,
+        _debug,
+        _info,
+        _warn,
+        _error,
+        _critical,
+        _noop
     ];
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -89,7 +65,6 @@ public static class ExLogger
 
     #region Cached EventIds
 
-    // 🔒 Cached EventIds for each log level to avoid allocating new instances at runtime
     private static readonly EventId _traceId = new(1, "TraceEvent");
     private static readonly EventId _debugId = new(2, "DebugEvent");
     private static readonly EventId _infoId = new(3, "InformationEvent");
@@ -97,12 +72,8 @@ public static class ExLogger
     private static readonly EventId _errorId = new(5, "ErrorEvent");
     private static readonly EventId _criticalId = new(6, "CriticalEvent");
 
-    // ✅ Cached instead of creating a new EventId for unknown levels each time
     private static readonly EventId _unknownId = new(9999, "UnknownEvent");
 
-    /// <summary>
-    /// Returns a cached <see cref="EventId"/> for the given log level.
-    /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static EventId GetEventId(LogLevel level) => level switch
     {
@@ -119,41 +90,25 @@ public static class ExLogger
 
     #region Timestamp Cache (Allocation-Free UTC)
 
-    // Cached ISO-8601 UTC timestamp refreshed every 1 ms via a static timer.
-    //  • Per-log cost: zero (atomic reference read only)
-    //  • Per-ms allocation: a single new string for the cache (not per log event)
-    //  • Completely thread-safe and lock-free.
-
-    // ✅ Initialize _utcBuffer first (so it's ready before timer starts)
     private static readonly ThreadLocal<char[]> _utcBuffer = new(() => new char[33]);
-
-    // ✅ Now safe to start timer (it may trigger immediately)
     private static readonly Timer _utcCacheTimer = new(UpdateUtc, null, 0, 1);
-
-    // Always points to the latest formatted UTC string; updated every 1 ms.
     private static volatile string _cachedUtc = FormatUtc();
 
-    // --- Timer callback (static to avoid closure allocations) --------------------
     private static void UpdateUtc(object _) =>
-        // Interlocked ensures atomic visibility even if timer callbacks overlap.
         Interlocked.Exchange(ref _cachedUtc, FormatUtc());
 
-    // --- UTC formatting helper ---------------------------------------------------
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static string FormatUtc()
     {
-        // ✅ Defensive: handle potential null (safety)
         var buf = _utcBuffer?.Value ?? new char[33];
         _ = DateTime.UtcNow.TryFormat(buf, out var len, "O", CultureInfo.InvariantCulture);
         return new string(buf, 0, len);
     }
 
-    // --- Safe timer shutdown -----------------------------------------------------
     public static void ShutdownUtcTimer()
     {
         try
         {
-            // Final atomic update before disposing the timer.
             _ = Interlocked.Exchange(ref _cachedUtc, FormatUtc());
 
             _ = _utcCacheTimer.Change(Timeout.Infinite, Timeout.Infinite);
@@ -182,23 +137,14 @@ public static class ExLogger
 
     #region Object Pool & Exception Formatter
 
-    // ♻️ Pool of StringBuilders to reduce allocations when formatting exceptions
-    // Shared provider allows expansion to other pooled objects later without extra providers.
     private static readonly ObjectPoolProvider _poolProvider = new DefaultObjectPoolProvider
     {
-        // Scale retention dynamically by core count
         MaximumRetained = Environment.ProcessorCount * 8
     };
 
     private static readonly ObjectPool<StringBuilder> _sbPool = _poolProvider.CreateStringBuilderPool();
-
-    // 🔁 Volatile to make runtime updates thread-safe without locks
     private static volatile Func<Exception, string, bool, string> _exceptionFormatter = FormatExceptionMessageInternal;
 
-    /// <summary>
-    /// Global formatter for exception logs.
-    /// Can be replaced with a custom formatter (e.g., JSON or structured format).
-    /// </summary>
     public static Func<Exception, string, bool, string> ExceptionFormatter
     {
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -211,10 +157,6 @@ public static class ExLogger
 
     #region Generic Log Methods
 
-    // ✅ Added non-allocating hot-path overloads (do not remove any existing methods)
-    // These avoid the 'params object[]' allocation when 0, 1, or 2 args are used.
-
-    /// <summary>Hot path: no args, no exception.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static void Log(ILogger logger, LogLevel level, string message)
     {
@@ -227,7 +169,6 @@ public static class ExLogger
         Resolve(level)(logger, message ?? "N/A", null);
     }
 
-    /// <summary>Hot path: 1 structured arg (avoids params[] allocation).</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static void Log<T1>(ILogger logger, LogLevel level, string message, T1 arg1)
     {
@@ -240,7 +181,6 @@ public static class ExLogger
         logger.Log(level, GetEventId(level), null, message ?? "N/A", arg1);
     }
 
-    /// <summary>Hot path: 2 structured args (avoids params[] allocation).</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static void Log<T1, T2>(ILogger logger, LogLevel level, string message, T1 arg1, T2 arg2)
     {
@@ -253,11 +193,6 @@ public static class ExLogger
         logger.Log(level, GetEventId(level), null, message ?? "N/A", arg1, arg2);
     }
 
-    /// <summary>
-    /// Generic log method.
-    /// ⚡ Uses precompiled delegates for fast-path logging when there are no arguments.
-    /// Falls back to structured logging when arguments are provided.
-    /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static void Log(ILogger logger, LogLevel level, string message, Exception exception, params object[] args)
     {
@@ -270,28 +205,19 @@ public static class ExLogger
 
         message ??= "N/A";
 
-        // ⚡ Fast-path: No arguments, use delegate
         if (args is null || args.Length == 0)
         {
             Resolve(level)(logger, message, exception);
             return;
         }
 
-        // Fallback: structured logging with placeholders
         logger.Log(level, GetEventId(level), exception, message, args);
     }
 
-    /// <summary>
-    /// Overload: log without an exception object.
-    /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static void Log(ILogger logger, LogLevel level, string message, params object[] args) =>
         Log(logger, level, message, null, args);
 
-    /// <summary>
-    /// Overload: log with structured message template and exception.
-    /// Preserves named placeholders ({UserId}, {OrderId}).
-    /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static void Log(ILogger logger, LogLevel level, Exception exception, string messageTemplate, params object[] args)
     {
@@ -303,14 +229,11 @@ public static class ExLogger
             return;
         }
 
-        // Ensure messageTemplate is never null for structured logging
         messageTemplate ??= "N/A";
 
-        // Fallback: structured logging with placeholders
         logger.Log(level, GetEventId(level), exception, messageTemplate, args ?? Array.Empty<object>());
     }
 
-    // ✅ Non-alloc fast-path helpers (kept internal to avoid breaking API surface but used by convenience methods)
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void LogNoArgs(ILogger logger, LogLevel level, string message)
     {
@@ -337,10 +260,6 @@ public static class ExLogger
 
     #region Convenience Methods
 
-    /// <summary>
-    /// Logs a message at <see cref="LogLevel.Trace"/>.
-    /// Use this for very detailed diagnostic information (typically only enabled during development).
-    /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static void ExLogTrace(this ILogger logger, string message, params object[] args)
     {
@@ -356,10 +275,6 @@ public static class ExLogger
         Log(logger, LogLevel.Trace, message, args);
     }
 
-    /// <summary>
-    /// Logs a message at <see cref="LogLevel.Debug"/>.
-    /// Useful for debugging and tracing application flow without being as verbose as <see cref="LogTrace"/>.
-    /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static void ExLogDebug(this ILogger logger, string message, params object[] args)
     {
@@ -375,10 +290,6 @@ public static class ExLogger
         Log(logger, LogLevel.Debug, message, args);
     }
 
-    /// <summary>
-    /// Logs a message at <see cref="LogLevel.Information"/>.
-    /// Intended for general application flow, user actions, or significant lifecycle events.
-    /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static void ExLogInformation(this ILogger logger, string message, params object[] args)
     {
@@ -394,10 +305,6 @@ public static class ExLogger
         Log(logger, LogLevel.Information, message, args);
     }
 
-    /// <summary>
-    /// Logs a message at <see cref="LogLevel.Warning"/>.
-    /// Use this when something unexpected occurred or a non-critical issue needs attention.
-    /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static void ExLogWarning(this ILogger logger, string message, params object[] args)
     {
@@ -413,10 +320,6 @@ public static class ExLogger
         Log(logger, LogLevel.Warning, message, args);
     }
 
-    /// <summary>
-    /// Logs a message and an exception at <see cref="LogLevel.Error"/>.
-    /// Use this when an operation fails but the application can continue running.
-    /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static void ExLogError(this ILogger logger, string message, Exception exception, params object[] args)
     {
@@ -433,10 +336,6 @@ public static class ExLogger
         Log(logger, LogLevel.Error, message, exception, args);
     }
 
-    /// <summary>
-    /// Logs a message at <see cref="LogLevel.Error"/>.
-    /// Use this overload when you want to log an error without an exception object.
-    /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static void ExLogError(this ILogger logger, string message, params object[] args)
     {
@@ -452,10 +351,6 @@ public static class ExLogger
         Log(logger, LogLevel.Error, message, args);
     }
 
-    /// <summary>
-    /// Logs a message and an exception at <see cref="LogLevel.Critical"/>.
-    /// Use this for unrecoverable failures or conditions that require immediate attention.
-    /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static void ExLogCritical(this ILogger logger, string message, Exception exception, params object[] args)
     {
@@ -472,10 +367,6 @@ public static class ExLogger
         Log(logger, LogLevel.Critical, message, exception, args);
     }
 
-    /// <summary>
-    /// Logs a message at <see cref="LogLevel.Critical"/> without an exception.
-    /// Use this overload when you want to log critical error without an exception object.
-    /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static void ExLogCritical(this ILogger logger, string message, params object[] args)
     {
@@ -494,10 +385,6 @@ public static class ExLogger
     #endregion Convenience Methods
 
     #region Exception Logging
-
-    /// <summary>
-    /// Logs an exception at Error level with formatted details.
-    /// </summary>
     public static void ExLogErrorException(this ILogger logger, Exception ex, string title = "System Error", bool moreDetailsEnabled = false)
     {
         ArgumentNullException.ThrowIfNull(logger);
@@ -512,9 +399,6 @@ public static class ExLogger
         LogNoArgs(logger, LogLevel.Error, msg, ex);
     }
 
-    /// <summary>
-    /// Logs an exception at Critical level with formatted details.
-    /// </summary>
     public static void ExLogCriticalException(this ILogger logger, Exception ex, string title = "Critical System Error", bool moreDetailsEnabled = false)
     {
         ArgumentNullException.ThrowIfNull(logger);
@@ -529,21 +413,14 @@ public static class ExLogger
         LogNoArgs(logger, LogLevel.Critical, msg, ex);
     }
 
-    /// <summary>
-    /// Default exception formatter.
-    /// Includes timestamp, type, message, HRESULT, stack trace, and inner exceptions.
-    /// Uses pooled <see cref="StringBuilder"/> to reduce allocations.
-    /// </summary>
     private static string FormatExceptionMessageInternal(Exception ex, string title, bool moreDetailsEnabled)
     {
-        // Heuristic pre-size to reduce growth copies
         var sb = _sbPool.Get();
         try
         {
             _ = sb.Clear();
             _ = sb.EnsureCapacity(1024);
 
-            // 📋 Basic exception info
             _ = sb.Append("Timestamp      : ").AppendLine(_cachedUtc)
               .Append("Title          : ").AppendLine(title ?? "N/A")
               .Append("Exception Type : ").AppendLine(ex.GetType().FullName)
@@ -552,7 +429,6 @@ public static class ExLogger
               .Append("Source         : ").AppendLine(ex.Source ?? "N/A")
               .Append("Target Site    : ").AppendLine(ex.TargetSite?.Name ?? "N/A");
 
-            // 📋 Detailed info (optional)
             if (moreDetailsEnabled)
             {
                 var st = ex.StackTrace;
@@ -576,10 +452,6 @@ public static class ExLogger
         }
     }
 
-    /// <summary>
-    /// Recursively appends details of inner exceptions with indentation.
-    /// Stops at maxDepth to avoid excessive logging in recursive exception chains.
-    /// </summary>
     private static void AppendInnerExceptionDetails(StringBuilder sb, Exception inner, int depth, int maxDepth = 5)
     {
         if (inner is null || depth > maxDepth)
@@ -587,7 +459,6 @@ public static class ExLogger
             return;
         }
 
-        // indent is a few '>' chars; avoid string.Join/LINQ
         var indent = new string('>', depth);
 
         _ = sb.Append(indent).Append(" Exception Type : ").AppendLine(inner.GetType().FullName)
@@ -603,7 +474,6 @@ public static class ExLogger
               .AppendLine(st.Trim());
         }
 
-        // Special case: AggregateException contains multiple inner exceptions
         if (inner is AggregateException agg && agg.InnerExceptions.Count > 0)
         {
             for (var i = 0; i < agg.InnerExceptions.Count; i++)
@@ -623,10 +493,6 @@ public static class ExLogger
 
     #region Log Scope Helper
 
-    /// <summary>
-    /// Begins a structured logging scope with a single key-value pair.
-    /// Useful for correlating logs (e.g., RequestId, UserId).
-    /// </summary>
     public static IDisposable ExBeginScope(this ILogger logger, string key, object value)
     {
         ArgumentNullException.ThrowIfNull(logger);
@@ -638,14 +504,9 @@ public static class ExLogger
 
         var scope = new SingleScope(key, value);
 
-        // Try BeginScope; if it returns null (e.g., in unit tests), wrap our scope in a disposable
         return logger.BeginScope(scope) ?? new DisposableScope(scope);
     }
 
-    /// <summary>
-    /// Begins a structured logging scope with multiple key-value pairs.
-    /// Optimized for small dictionaries (≤4 items) to reduce allocations.
-    /// </summary>
     public static IDisposable ExBeginScope(this ILogger logger, IDictionary<string, object> context)
     {
         ArgumentNullException.ThrowIfNull(logger);
@@ -680,10 +541,6 @@ public static class ExLogger
         }
     }
 
-    /// <summary>
-    /// Represents a scope with a single key-value pair.
-    /// Implements IReadOnlyList to avoid iterator allocations.
-    /// </summary>
     private readonly struct SingleScope : IReadOnlyList<KeyValuePair<string, object>>
     {
         private readonly KeyValuePair<string, object> _pair;
@@ -733,9 +590,6 @@ public static class ExLogger
         }
     }
 
-    /// <summary>
-    /// Represents a scope with multiple key-value pairs using a List.
-    /// </summary>
     private sealed class ScopeWrapper : IReadOnlyList<KeyValuePair<string, object>>
     {
         private readonly List<KeyValuePair<string, object>> _items;
@@ -772,10 +626,6 @@ public static class ExLogger
         }
     }
 
-    /// <summary>
-    /// Represents a scope optimized for small dictionaries (≤4 items).
-    /// Uses an array instead of a List to minimize allocations.
-    /// </summary>
     private sealed class SmallScopeWrapper : IReadOnlyList<KeyValuePair<string, object>>
     {
         private readonly KeyValuePair<string, object>[] _items;
@@ -845,27 +695,9 @@ public static class ExLogger
 
     #region Extensibility Hooks (Async/Batch Ready)
 
-    /// <summary>
-    /// Optional hook for a future async/batching sink.
-    /// <para>
-    /// Currently a placeholder — allows pre-filtering of log events before
-    /// dispatch to asynchronous or external sinks (e.g., Kafka, Seq, etc.).
-    /// </para>
-    /// </summary>
     public static Func<LogLevel, string, Exception, bool> AsyncSinkFilter { get; private set; } = static (_, _, _) => true;
-
-    /// <summary>
-    /// Configure a custom filter intended for a future async/batching sink (placeholder).
-    /// </summary>
-    /// </summary>
     public static void UseAsyncSinkProvider(Func<LogLevel, string, Exception, bool> filter)
         => AsyncSinkFilter = filter ?? AsyncSinkFilter;
-
-    /// <summary>
-    /// Flushes any pending log batches asynchronously.
-    /// Currently, this is a lightweight placeholder that ensures compatibility
-    /// with future async batching or off-thread sink dispatch implementations.
-    /// </summary>
     public static async Task FlushAsync(CancellationToken cancellationToken = default)
     {
         try
@@ -873,8 +705,6 @@ public static class ExLogger
             cancellationToken.ThrowIfCancellationRequested();
 
             await Task.Yield();
-
-            // Future expansion placeholder safely wrapped.
         }
         catch (OperationCanceledException)
         {
@@ -886,7 +716,6 @@ public static class ExLogger
         }
         catch (Exception ex)
         {
-            // Defensive fail-safe (log or swallow)
             Debug.WriteLine($"ExLogger.FlushAsync encountered error: {ex}");
         }
     }

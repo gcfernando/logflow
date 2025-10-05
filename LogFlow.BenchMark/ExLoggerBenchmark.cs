@@ -22,15 +22,12 @@ public class ExLoggerBenchmark
     {
         _logger = DevNullLogger.Instance;
         _msg = "User {UserId} performed {Action} on {Entity}";
-        // Ensure the static timestamp cache in ExLogger is primed before measuring
         ExLogger.Log(_logger, LogLevel.Debug, "Warmup");
     }
 
-    // ---------- Hot path: no args ----------
     [Benchmark(Baseline = true, Description = "LoggerMessage (no args)"), BenchmarkCategory("ExLogger.NoArgs")]
     public void LoggerMessage_NoArgs()
     {
-        // Using the predefined delegate pattern (similar to ExLogger’s fast path)
         LoggerMessage.Define<string>(LogLevel.Information, new EventId(1001, "Info"), "{Message}")
             (_logger, "Hello", null);
     }
@@ -38,7 +35,6 @@ public class ExLoggerBenchmark
     [Benchmark(Description = "ExLogger.Log(no args)"), BenchmarkCategory("ExLogger.NoArgs")]
     public void ExLogger_NoArgs() => ExLogger.Log(_logger, LogLevel.Information, "Hello world");
 
-    // ---------- Structured args ----------
     [Benchmark(Baseline = true, Description = "ILogger.Log with args"), BenchmarkCategory("ExLogger.Structured")]
     public void ILogger_WithArgs()
     {
@@ -52,7 +48,6 @@ public class ExLoggerBenchmark
     [Benchmark(Description = "ExLogger.Log(params) 3 args"), BenchmarkCategory("ExLogger.Structured")]
     public void ExLogger_Params3() => ExLogger.Log(_logger, LogLevel.Information, _msg, Samples.Args3);
 
-    // ---------- Exceptions ----------
     [Benchmark(Baseline = true, Description = "ILogger.Log(exception)"), BenchmarkCategory("ExLogger.Exception")]
     public void ILogger_Exception() => _logger.Log(LogLevel.Error, Samples.ExBasic, "Operation failed: {Reason}", "timeout");
 
@@ -65,7 +60,6 @@ public class ExLoggerBenchmark
     [Benchmark(Description = "ExLogger.ExceptionFormatter (deep+details)"), BenchmarkCategory("ExLogger.Exception")]
     public string ExLoggerExceptionFormattingDeep() => ExLogger.ExceptionFormatter(Samples.ExDeep, "Critical System Error", true);
 
-    // ---------- Scopes ----------
     [Benchmark(Baseline = true, Description = "ILogger.BeginScope(single)"), BenchmarkCategory("ExLogger.Scope")]
     public void ILogger_BeginScope_Single()
     {

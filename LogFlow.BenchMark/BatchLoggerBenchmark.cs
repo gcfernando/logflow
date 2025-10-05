@@ -6,7 +6,6 @@ using LogFlow.Core.Batching.Model;
 using LogFlow.Core.Batching.Model.Enums;
 using LogFlow.Core.ExLogging;
 using Microsoft.Extensions.Logging;
-
 namespace LogFlow.BenchMark;
 
 [CategoriesColumn, GroupBenchmarksBy(BenchmarkLogicalGroupRule.ByCategory)]
@@ -40,7 +39,6 @@ public class BatchLoggerBenchmarks
 
         _tempDir = new TempDir();
 
-        // Batch with default options, forwarding enabled
         _batch = new BatchLogger(_downstream, new BatchLoggerOptions
         {
             Capacity = 100_000,
@@ -54,7 +52,6 @@ public class BatchLoggerBenchmarks
             Database = new BatchDatabaseOptions { Enabled = false }
         });
 
-        // Batch with composed file sink (text) but no forwarding, to measure sink cost apart
         _batchNoForward = new BatchLogger(_downstream, new BatchLoggerOptions
         {
             Capacity = 100_000,
@@ -72,7 +69,6 @@ public class BatchLoggerBenchmarks
             Database = new BatchDatabaseOptions { Enabled = false }
         });
 
-        // Warm
         _batch.ExLogInformation("warmup");
         _batchNoForward.ExLogInformation("warmup");
     }
@@ -86,8 +82,6 @@ public class BatchLoggerBenchmarks
         _cts.Dispose();
         _tempDir.Dispose();
     }
-
-    // ---------------- Enqueue (fast path) ----------------
 
     [Benchmark(Baseline = true, Description = "ILogger direct (no batch) N logs"), BenchmarkCategory("Batch.Enqueue")]
     public void ILogger_Direct_NoBatch()
@@ -125,8 +119,6 @@ public class BatchLoggerBenchmarks
 
         batch.Dispose();
     }
-
-    // ---------------- Flush paths ----------------
 
     [Benchmark(Description = "Flush -> default (forward to ILogger)"), BenchmarkCategory("Batch.Flush")]
     public Task Flush_Default_ForwardILogger()
@@ -199,8 +191,6 @@ public class BatchLoggerBenchmarks
         await batch.DisposeAsync();
     }
 
-    // ---------------- Contention / Parallel writers ----------------
-
     [Params(1, 4, 16)]
     public int Writers;
 
@@ -234,8 +224,6 @@ public class BatchLoggerBenchmarks
         await batch.FlushAsync();
         await batch.DisposeAsync();
     }
-
-    // ---------------- Size rolling test (File) ----------------
 
     [Benchmark(Description = "FileSink size rolling (small limit)"), BenchmarkCategory("Batch.Rolling")]
     public async Task FileSink_Size_Rolling()

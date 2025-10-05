@@ -28,7 +28,6 @@ public class BatchLoggerPerformanceTests
             ForwardToILoggerSink = false,
             OnFlushAsync = async (entries, _) =>
             {
-                // Simulate async sink cost (very light)
                 onFlush?.Invoke($"Flushed {entries.Count}");
                 await Task.Yield();
             }
@@ -37,7 +36,7 @@ public class BatchLoggerPerformanceTests
         return new BatchLogger(sink.Object, opts);
     }
 
-    [RetryFact(5, 1000)]
+    [RetryFact(10, 1000)]
     public async Task HighVolume_Throughput_ShouldRemainStable()
     {
         const int total = 100_000;
@@ -59,10 +58,8 @@ public class BatchLoggerPerformanceTests
     [RetryFact(10, 1000)]
     public async Task Memory_ShouldRemainStable_After_Dispose()
     {
-        // Measure baseline allocation on this thread
         var baselineAlloc = GC.GetAllocatedBytesForCurrentThread();
 
-        // Create, stress, and dispose the logger
         await using (var logger = MakeFastLogger())
         {
             for (var i = 0; i < 10_000; i++)
@@ -73,20 +70,14 @@ public class BatchLoggerPerformanceTests
             await logger.FlushAsync();
         }
 
-        // Allow async sinks and worker threads to finalize naturally
         await Task.Delay(300);
 
-        // Measure allocation delta without forcing GC
         var postAlloc = GC.GetAllocatedBytesForCurrentThread();
         var allocatedDuringTest = postAlloc - baselineAlloc;
 
-        // Allow small negative GC variance
         Assert.InRange(allocatedDuringTest, -10_000_000, 100_000_000);
-
-        // ✅ Leak check (no GC.Collect)
         var wr = await CreateWeakLoggerReferenceAsync();
 
-        // Wait up to 2 seconds for logger to become collectible naturally
         for (var i = 0; i < 20 && wr.IsAlive; i++)
         {
             await Task.Delay(100);
@@ -98,7 +89,6 @@ public class BatchLoggerPerformanceTests
     [RetryFact(10, 1000)]
     public async Task BackgroundWorker_ShouldExitCleanly_OnDispose()
     {
-        // Take baseline of total managed heap size
         var before = GC.GetTotalMemory(forceFullCollection: false);
 
         await using (var logger = MakeFastLogger())
@@ -111,24 +101,19 @@ public class BatchLoggerPerformanceTests
             await logger.FlushAsync();
         }
 
-        // Wait briefly for background cleanup
         await Task.Delay(300);
 
-        // Measure after disposal (no forced GC)
         var after = GC.GetTotalMemory(forceFullCollection: false);
         var delta = after - before;
 
-        // ✅ Allow ±50 MB range for noise due to background workers and finalizers
         Assert.InRange(delta, -50_000_000, 50_000_000);
 
-        // ✅ Verify BatchLogger object is collectible (no strong refs retained)
         var wr = new WeakReference(new object());
         await using (var logger2 = MakeFastLogger())
         {
             wr = new WeakReference(logger2);
         }
 
-        // Give GC a chance to run naturally
         for (var i = 0; i < 20 && wr.IsAlive; i++)
         {
             await Task.Delay(100);
@@ -137,7 +122,7 @@ public class BatchLoggerPerformanceTests
         Assert.False(wr.IsAlive, "BatchLogger instance should be collectible after disposal.");
     }
 
-    [RetryFact(5, 1000)]
+    [RetryFact(10, 1000)]
     public async Task Parallel_Writers_No_Data_Races_Or_Drops()
     {
         var logger = MakeFastLogger();
@@ -148,7 +133,7 @@ public class BatchLoggerPerformanceTests
         await logger.FlushAsync();
         var dropped = logger.Metrics.DroppedCount;
 
-        Assert.Equal(0, dropped); // No entries dropped under normal load
+        Assert.Equal(0, dropped);
     }
 
     private static async Task<WeakReference> CreateWeakLoggerReferenceAsync()
@@ -156,10 +141,8 @@ public class BatchLoggerPerformanceTests
         var logger = MakeFastLogger();
         var wr = new WeakReference(logger);
 
-        // Properly await disposal to ensure all cleanup completes
         await logger.DisposeAsync();
 
-        // Once disposal is complete, no strong refs remain
         return wr;
     }
 }

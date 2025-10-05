@@ -60,7 +60,6 @@ public class BatchLoggerFileSinkTests : IDisposable
                 RollingInterval = interval,
                 RetainedFileCountLimit = retain
             },
-            // compose file sink
             OnFlushAsync = null
         };
 
@@ -104,7 +103,6 @@ public class BatchLoggerFileSinkTests : IDisposable
         var path = FilePath("roll.log");
         await using var logger = MakeFileLogger(path, BatchFileFormat.Text, rollingSize: 1_000, interval: RollingInterval.None, retain: 2);
 
-        // Write logs in small batches to trigger multiple rolls
         for (var i = 0; i < 5; i++)
         {
             for (var j = 0; j < 50; j++)
@@ -113,10 +111,9 @@ public class BatchLoggerFileSinkTests : IDisposable
             }
 
             await logger.FlushAsync();
-            await Task.Delay(20); // let file system catch up
+            await Task.Delay(20);
         }
 
-        // Assert rotations
         Assert.True(File.Exists(path));
         Assert.True(File.Exists(path + ".1"));
         Assert.True(File.Exists(path + ".2"));
@@ -136,7 +133,6 @@ public class BatchLoggerFileSinkTests : IDisposable
         var file = Path.GetFileNameWithoutExtension(basePath);
         var ext = Path.GetExtension(basePath);
 
-        // Find created weekly file "<file>-YYYYMMDD-W<week><ext>"
         var created = Directory.GetFiles(dir, $"{file}-*{ext}").Single();
         Assert.Contains("-W", Path.GetFileNameWithoutExtension(created));
     }

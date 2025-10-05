@@ -1,5 +1,6 @@
 ﻿using System.Data.Common;
 using System.Globalization;
+using System.Linq;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Channels;
@@ -16,125 +17,54 @@ namespace LogFlow.Core.Batching;
  * Contact   ::> f.gehan@gmail.com / + 46 73 701 40 25
 */
 
-/// <summary>
-/// Provides an asynchronous, batched implementation of <see cref="ILogger"/>.
-/// Entries are queued via a bounded <see cref="Channel{T}"/> and flushed to one or more sinks
-/// when either a size threshold (<see cref="BatchLoggerOptions.BatchSize"/>) or a time threshold
-/// (<see cref="BatchLoggerOptions.FlushInterval"/>) is met.
-/// </summary>
-/// <remarks>
-/// <para>
-/// This logger is optimized for high-throughput scenarios. It minimizes contention on logging hot paths
-/// by avoiding synchronous I/O and delegating work to a single background consumer.
-/// </para>
-/// <para>
-/// Thread safety:
-/// Writers enqueue entries concurrently without locks (except the channel's own concurrency).
-/// The internal buffer (<see cref="_buffer"/>) is only accessed by the background worker and during flush paths
-/// after cancellation/await ensures single-threaded access.
-/// </para>
-/// <para>
-/// Disposal:
-/// On <see cref="Dispose"/> or <see cref="DisposeAsync"/>, the worker is cancelled and any remaining entries
-/// are flushed (respecting custom sinks if configured). Async disposal is preferred for best responsiveness.
-/// </para>
-/// </remarks>
 public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
 {
-    // Primary downstream logger used for compatibility flushing and as a default sink.
     private readonly ILogger _sink;
-
-    // Bounded channel that buffers log entries. Single reader (the worker), multiple writers (log callers).
     private readonly Channel<LogEntry> _channel;
-
-    // Cancellation token source used to stop the background worker and coordinate graceful shutdown.
     private readonly CancellationTokenSource _cts = new();
-
-    // Background task that drains the channel, batches entries, and triggers flushes.
     private readonly Task _worker;
-
-    // Lock object used to synchronize flush operations when a custom async sink is configured.
     private readonly object _sync = new();
-
-    // Effective options for this logger instance.
     private readonly BatchLoggerOptions _options;
-
-    // When OnFlushAsync is not provided, we may build a composite sink from options.
     private readonly Func<IReadOnlyList<BatchLogEntry>, CancellationToken, Task> _composedFlushAsync;
-
-    // NOTE: _buffer is only touched by the background worker and flush methods
-    // after the worker has been cancelled/awaited. It is NOT thread-safe by design.
     private List<LogEntry> _buffer = [];
-
     private int _approxQueueLength;
 
-    /// <summary>
-    /// Exposes counters and timestamps such as dropped entry count and last flush time.
-    /// Useful for health metrics and diagnostics dashboards.
-    /// </summary>
     public BatchLoggerMetrics Metrics { get; } = new();
-
-    /// <summary>
-    /// Exception formatter used by <c>ExLog*Exception</c> helpers.
-    /// Defaults to <see cref="ExLogger.ExceptionFormatter"/>.
-    /// </summary>
     public Func<Exception, string, bool, string> ExceptionFormatter { get; set; } = ExLogger.ExceptionFormatter;
 
-    /// <summary>
-    /// Initializes a new instance of the <see cref="BatchLogger"/> class.
-    /// </summary>
-    /// <param name="sink">Underlying <see cref="ILogger"/> used as a fallback and/or composed sink.</param>
-    /// <param name="options">Optional configuration; if null, sensible defaults are used.</param>
-    /// <exception cref="ArgumentNullException">Thrown if <paramref name="sink"/> is null.</exception>
     public BatchLogger(ILogger sink, BatchLoggerOptions options = null)
     {
         _sink = sink ?? throw new ArgumentNullException(nameof(sink));
         _options = options ?? new BatchLoggerOptions();
         _buffer = new List<LogEntry>(_options.BatchSize);
 
-        // Create a bounded channel with backpressure; when full, drop oldest to avoid blocking the app.
         _channel = Channel.CreateBounded<LogEntry>(new BoundedChannelOptions(_options.Capacity)
         {
             SingleReader = true,
             SingleWriter = false,
-            FullMode = BoundedChannelFullMode.DropOldest
+            FullMode = _options.ChannelFullMode
         });
 
         _ = _cts.Token.Register(() => _channel.Writer.TryComplete());
 
-        // If the caller didn't provide OnFlushAsync but enabled file/database options,
-        // build a composed async flush pipeline.
         _composedFlushAsync = BuildComposedFlushIfNeeded(_options, _sink);
 
-        // Start the single-reader background worker that processes the queue.
         _worker = Task.Run(() => ProcessAsync(_cts.Token), _cts.Token);
     }
 
-    // ---------------- ILogger ----------------
-
-    /// <inheritdoc />
     public bool IsEnabled(LogLevel logLevel) => _sink.IsEnabled(logLevel);
 
-    /// <inheritdoc />
     public IDisposable BeginScope<TState>(TState state)
-        // Preserve any underlying scope if available; else return a no-op scope to avoid null checks.
         => _sink.BeginScope(state) ?? NullScope.Instance;
 
-    /// <inheritdoc />
-    /// <remarks>
-    /// This method performs minimal work on the caller thread:
-    /// it evaluates the formatter (if present), runs an optional filter, and enqueues the entry.
-    /// If the channel is full, the oldest entry is dropped (configured in channel options).
-    /// </remarks>
     public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception exception,
         Func<TState, Exception, string> formatter)
     {
         if (!IsEnabled(logLevel))
         {
-            return; // Fast path: disabled level
+            return;
         }
 
-        // Build the message and extract structured logging args if present.
         var msg = formatter != null ? formatter(state, exception) : state?.ToString() ?? "N/A";
 
         var args = Array.Empty<object>();
@@ -152,48 +82,23 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
             }
         }
 
-        // Optional filter: if provided by options, allow the caller to short-circuit logging.
         if (_options.Filter != null && !_options.Filter(logLevel, msg, exception, args))
         {
             return;
         }
 
-        // Enqueue to the bounded channel. If it fails (buffer full), increment drop metric.
         Enqueue(new LogEntry(logLevel, msg, exception, args));
     }
 
-    // ---------------- ExLogger-style Methods ----------------
-
-    /// <summary>Logs at <see cref="LogLevel.Trace"/>.</summary>
     public void ExLogTrace(string msg, params object[] args) => LogInternal(LogLevel.Trace, msg, null, args);
-
-    /// <summary>Logs at <see cref="LogLevel.Debug"/>.</summary>
     public void ExLogDebug(string msg, params object[] args) => LogInternal(LogLevel.Debug, msg, null, args);
-
-    /// <summary>Logs at <see cref="LogLevel.Information"/>.</summary>
     public void ExLogInformation(string msg, params object[] args) => LogInternal(LogLevel.Information, msg, null, args);
-
-    /// <summary>Logs at <see cref="LogLevel.Warning"/>.</summary>
     public void ExLogWarning(string msg, params object[] args) => LogInternal(LogLevel.Warning, msg, null, args);
-
-    /// <summary>Logs at <see cref="LogLevel.Error"/> with a message.</summary>
     public void ExLogError(string msg, params object[] args) => LogInternal(LogLevel.Error, msg, null, args);
-
-    /// <summary>Logs at <see cref="LogLevel.Error"/> with an exception.</summary>
     public void ExLogError(string msg, Exception ex, params object[] args) => LogInternal(LogLevel.Error, msg, ex, args);
-
-    /// <summary>Logs at <see cref="LogLevel.Critical"/> with a message.</summary>
     public void ExLogCritical(string msg, params object[] args) => LogInternal(LogLevel.Critical, msg, null, args);
-
-    /// <summary>Logs at <see cref="LogLevel.Critical"/> with an exception.</summary>
     public void ExLogCritical(string msg, Exception ex, params object[] args) => LogInternal(LogLevel.Critical, msg, ex, args);
 
-    /// <summary>
-    /// Formats and logs an exception at <see cref="LogLevel.Error"/> using <see cref="ExceptionFormatter"/>.
-    /// </summary>
-    /// <param name="ex">Exception instance to log.</param>
-    /// <param name="title">Short human-readable title for the exception.</param>
-    /// <param name="details">If true, include extended details in the formatted message.</param>
     public void ExLogErrorException(Exception ex, string title = "System Error", bool details = false)
     {
         if (!IsEnabled(LogLevel.Error))
@@ -201,10 +106,8 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
             return;
         }
 
-        // Format message with the provided or default exception formatter.
         var msg = (ExceptionFormatter ?? ExLogger.ExceptionFormatter)(ex, title, details);
 
-        // Respect optional filter.
         if (_options.Filter != null && !_options.Filter(LogLevel.Error, msg, ex, Array.Empty<object>()))
         {
             return;
@@ -213,12 +116,6 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
         LogInternal(LogLevel.Error, msg, ex);
     }
 
-    /// <summary>
-    /// Formats and logs an exception at <see cref="LogLevel.Critical"/> using <see cref="ExceptionFormatter"/>.
-    /// </summary>
-    /// <param name="ex">Exception instance to log.</param>
-    /// <param name="title">Short human-readable title for the exception.</param>
-    /// <param name="details">If true, include extended details in the formatted message.</param>
     public void ExLogCriticalException(Exception ex, string title = "Critical System Error", bool details = false)
     {
         if (!IsEnabled(LogLevel.Critical))
@@ -228,7 +125,6 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
 
         var msg = (ExceptionFormatter ?? ExLogger.ExceptionFormatter)(ex, title, details);
 
-        // Respect optional filter.
         if (_options.Filter != null && !_options.Filter(LogLevel.Critical, msg, ex, Array.Empty<object>()))
         {
             return;
@@ -237,12 +133,6 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
         LogInternal(LogLevel.Critical, msg, ex);
     }
 
-    // ---------------- Internal Core ----------------
-
-    /// <summary>
-    /// Common internal logging path for the ExLogger-style helpers.
-    /// Applies filtering and enqueues a <see cref="LogEntry"/>.
-    /// </summary>
     private void LogInternal(LogLevel lvl, string msg, Exception ex, params object[] args)
     {
         if (!IsEnabled(lvl))
@@ -250,7 +140,6 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
             return;
         }
 
-        // Respect optional filter across all helper-based calls.
         if (_options.Filter != null && !_options.Filter(lvl, msg ?? "N/A", ex, args))
         {
             return;
@@ -260,35 +149,28 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
         Enqueue(entry);
     }
 
-    /// <summary>
-    /// Attempts to write a log entry into the channel; if the channel is full, increments the dropped count.
-    /// </summary>
     private void Enqueue(LogEntry entry)
     {
-        // Try to write first
-        if (_channel.Writer.TryWrite(entry))
+        if (_options.ChannelFullMode == BoundedChannelFullMode.DropOldest &&
+            _approxQueueLength >= _options.Capacity)
         {
-            // Approximate backpressure detection
-            var len = Interlocked.Increment(ref _approxQueueLength);
-
-            // If we are above capacity, a DropOldest likely occurred
-            if (len > _options.Capacity)
-            {
-                Metrics.IncrementDropped();
-                Interlocked.Exchange(ref _approxQueueLength, _options.Capacity);
-            }
-
-            return;
+            Metrics.IncrementDropped();
         }
 
-        // If TryWrite failed entirely (writer completed)
-        Metrics.IncrementDropped();
+        if (_channel.Writer.TryWrite(entry))
+        {
+            var len = Interlocked.Increment(ref _approxQueueLength);
+            if (len > _options.Capacity)
+            {
+                Interlocked.Exchange(ref _approxQueueLength, _options.Capacity);
+            }
+        }
+        else
+        {
+            Metrics.IncrementDropped();
+        }
     }
 
-    /// <summary>
-    /// Background worker loop that waits on either new data or the flush interval, drains the channel,
-    /// and flushes the accumulated batch when size or time thresholds are met.
-    /// </summary>
     private async Task ProcessAsync(CancellationToken token)
     {
         var reader = _channel.Reader;
@@ -299,25 +181,21 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
         {
             while (!token.IsCancellationRequested)
             {
-                // Race between data availability and timer. Whichever completes first triggers a pass.
                 var delayTask = Task.Delay(flushInterval, token);
                 var readTask = reader.WaitToReadAsync(token).AsTask();
                 var completed = await Task.WhenAny(readTask, delayTask).ConfigureAwait(false);
 
-                // Drain any available items immediately.
                 while (reader.TryRead(out var entry))
                 {
                     Interlocked.Decrement(ref _approxQueueLength);
                     _buffer.Add(entry);
 
-                    // If we hit the batch size threshold, flush immediately to reduce memory pressure.
                     if (_buffer.Count >= batchSize)
                     {
                         await FlushAsync(token).ConfigureAwait(false);
                     }
                 }
 
-                // If the time-based trigger fired and we have items, flush them.
                 if (_buffer.Count > 0 && completed == delayTask)
                 {
                     await FlushAsync(token).ConfigureAwait(false);
@@ -330,7 +208,6 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
         }
         catch (Exception ex)
         {
-            // Log via the underlying sink and also surface through the optional internal error callback.
             try
             {
                 ExLogger.Log(_sink, LogLevel.Error, "BatchLogger background failure", ex);
@@ -350,17 +227,12 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
             }
         }
 
-        // Final flush attempt after loop exits.
         if (_buffer.Count > 0)
         {
             await FlushAsync(CancellationToken.None).ConfigureAwait(false);
         }
     }
 
-    /// <summary>
-    /// Flushes a concrete buffer (direct to <see cref="_sink"/>). Used when no custom async sink is present.
-    /// </summary>
-    /// <param name="buf">Buffer to flush. This buffer will be cleared on exit.</param>
     private void Flush(List<LogEntry> buf)
     {
         if (buf.Count == 0)
@@ -374,46 +246,41 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
             {
                 try
                 {
-                    // Use the ExLogger helper to preserve formatting behavior.
                     ExLogger.Log(_sink, e.Level, e.Message, e.Exception, e.Args);
                 }
                 catch (Exception ex)
                 {
-                    // If individual sink write fails, record a drop and surface an internal error.
                     Metrics.IncrementDropped();
                     System.Diagnostics.Debug.WriteLine($"[BatchLogger] Flush error: {ex}");
                     try
-                    { _options.OnInternalError?.Invoke("BatchLogger flush error", ex); }
-                    catch { /* ignore */ }
+                    {
+                        _options.OnInternalError?.Invoke("BatchLogger flush error", ex);
+                    }
+                    catch
+                    {
+                        // ignore secondary error
+                    }
                 }
             }
 
-            // Update metrics on success.
             Metrics.AddFlushed(buf.Count);
             Metrics.SetLastFlush(DateTime.UtcNow);
         }
         finally
         {
-            buf.Clear(); // Always clear to free memory and reset state.
+            buf.Clear();
         }
     }
 
-    /// <summary>
-    /// Public async flush. If a custom sink handler is configured (via <see cref="BatchLoggerOptions.OnFlushAsync"/>
-    /// or built-in composition), it is used; otherwise, the flush falls back to the underlying <see cref="_sink"/>.
-    /// </summary>
-    /// <param name="token">Cancellation token to cooperatively cancel the flush.</param>
     public async Task FlushAsync(CancellationToken token = default)
     {
         token.ThrowIfCancellationRequested();
 
-        // Drain any remaining channel items before swapping
         while (_channel.Reader.TryRead(out var entry))
         {
             _buffer.Add(entry);
         }
 
-        // Atomically swap buffers — lock-free
         var toFlush = Interlocked.Exchange(ref _buffer, new List<LogEntry>(_options.BatchSize));
 
         if (toFlush.Count == 0)
@@ -454,33 +321,25 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
         }
     }
 
-    /// <summary>
-    /// Flushes the in-memory buffer using the configured custom sink delegate or composed sinks.
-    /// Falls back to direct sink flush upon exceptions to reduce data loss.
-    /// Also forwards entries to the underlying ILogger when forwarding is enabled.
-    /// </summary>
     private async Task FlushViaCustomSinkAsync(CancellationToken token)
     {
         List<BatchLogEntry> snapshot;
 
-        // 🔒 Lock around the entire snapshot read/clear section
         lock (_sync)
         {
             if (_buffer.Count == 0)
             {
-                return; // nothing to flush
+                return;
             }
 
-            // Create a stable snapshot
             snapshot = _buffer
                 .ConvertAll(e => new BatchLogEntry(e.Level, e.Message, e.Exception, e.Args));
 
-            _buffer.Clear(); // clear now that we've captured everything
+            _buffer.Clear();
         }
 
         try
         {
-            // ✅ Execute either the user-provided or composed sink delegate
             if (_options.OnFlushAsync is not null)
             {
                 await _options.OnFlushAsync(snapshot, token).ConfigureAwait(false);
@@ -491,18 +350,19 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
             }
             else
             {
-                // ✅ FIX: call Flush on internal buffer type, not snapshot
+                var fallbackEntries = snapshot
+                    .ConvertAll(e => new LogEntry(e.Level, e.Message, e.Exception,
+                        e.Args is { Count: > 0 } ? [.. e.Args] : Array.Empty<object>()))
+;
+
                 lock (_sync)
                 {
-                    if (_buffer.Count > 0)
-                    {
-                        Flush(_buffer);
-                    }
+                    Flush(fallbackEntries);
                 }
+
                 return;
             }
 
-            // ✅ Also forward to underlying ILogger if requested
             if (_options.ForwardToILoggerSink)
             {
                 foreach (var e in snapshot)
@@ -516,58 +376,55 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
                 }
             }
 
-            // ✅ Update metrics to mirror direct flush path
             Metrics.AddFlushed(snapshot.Count);
             Metrics.SetLastFlush(DateTime.UtcNow);
         }
         catch (OperationCanceledException)
         {
-            throw; // propagate cooperative cancellation
+            throw;
         }
         catch (Exception ex)
         {
-            // Log and notify internal errors
             try
             {
                 _options.OnInternalError?.Invoke("BatchLogger OnFlushAsync handler error", ex);
             }
             catch
             {
-                // Swallow secondary diagnostics errors
+                // ignore secondary errors
             }
 
-            // Fallback to synchronous flush to minimize data loss
-            await Task.Run(() => Flush(snapshot.ConvertAll(
-                e => new LogEntry(e.Level, e.Message, e.Exception, [.. e.Args]))), token)
-            .ConfigureAwait(false);
+            lock (_sync)
+            {
+                try
+                {
+                    var fallbackEntries = snapshot
+                        .ConvertAll(e => new LogEntry(e.Level, e.Message, e.Exception,
+                            e.Args is { Count: > 0 } ? [.. e.Args] : Array.Empty<object>()));
+
+                    Flush(fallbackEntries);
+                }
+                catch (Exception innerEx)
+                {
+                    _options.OnInternalError?.Invoke("Fallback flush failed", innerEx);
+                }
+            }
         }
     }
 
 #if DEBUG
-    /// <summary>
-    /// Test helper that forces an immediate flush without requiring cancellation of the worker.
-    /// </summary>
     internal Task ForceFlushAsync(CancellationToken token = default) => FlushAsync(token);
 #endif
 
-    // ---------------- IDisposable ----------------
-
-    /// <summary>
-    /// Synchronous dispose. Cancels the worker, drains the channel, and flushes remaining entries.
-    /// If a custom async sink is configured, we attempt to flush via that sink; on failure we fallback
-    /// to direct sink flush to minimize data loss.
-    /// </summary>
     public void Dispose()
     {
         try
         {
-            // Stop accepting new writes and cancel the worker.
             _ = _channel.Writer.TryComplete();
             _cts.Cancel();
 
             try
             {
-                // Block until the worker finishes its loop.
                 _worker.GetAwaiter().GetResult();
             }
             catch (OperationCanceledException)
@@ -575,25 +432,21 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
                 // Expected when cancellation is cooperative.
             }
 
-            // Drain any remaining items that may have been enqueued after the last read pass.
             while (_channel.Reader.TryRead(out var e))
             {
                 _buffer.Add(e);
             }
 
-            // If there is data left, flush it now.
             if (_buffer.Count > 0)
             {
                 if (_options.OnFlushAsync is not null || _composedFlushAsync is not null)
                 {
                     try
                     {
-                        // Try custom sinks first, synchronously waited.
                         FlushViaCustomSinkAsync(CancellationToken.None).GetAwaiter().GetResult();
                     }
                     catch (Exception ex)
                     {
-                        // Notify and fallback to direct sink flush.
                         try
                         { _options.OnInternalError?.Invoke("BatchLogger Dispose flush error", ex); }
                         catch { /* ignore */ }
@@ -612,22 +465,16 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
         }
     }
 
-    /// <summary>
-    /// Asynchronous dispose. Cancels the worker using <see cref="CancellationTokenSource.CancelAsync"/>,
-    /// awaits the worker completion, and performs an asynchronous flush of remaining entries.
-    /// </summary>
     public async ValueTask DisposeAsync()
     {
         try
         {
             _ = _channel.Writer.TryComplete();
 
-            // Async-friendly cancellation in modern runtimes.
             await _cts.CancelAsync().ConfigureAwait(false);
 
             try
             {
-                // Await the worker so we know the reader has stopped.
                 await _worker.ConfigureAwait(false);
             }
             catch (OperationCanceledException)
@@ -635,7 +482,6 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
                 // Expected when cancellation is cooperative.
             }
 
-            // Finally flush whatever remains using the configured path.
             await FlushAsync().ConfigureAwait(false);
         }
         finally
@@ -644,23 +490,10 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
         }
     }
 
-    // ---------------- Internal record ----------------
-
-    /// <summary>
-    /// Internal immutable log entry used for fast, allocation-friendly queuing.
-    /// </summary>
     private readonly record struct LogEntry(LogLevel Level, string Message, Exception Exception, object[] Args);
 
-    // ---------------- Sink composition ----------------
-
-    /// <summary>
-    /// Builds a composed async flush delegate when <see cref="BatchLoggerOptions.OnFlushAsync"/> is not provided
-    /// but file and/or database sinks are enabled. Optionally includes forwarding to <see cref="ILogger"/>.
-    /// Returns <c>null</c> if no composition is required, allowing the logger to use its default flush path.
-    /// </summary>
     private static Func<IReadOnlyList<BatchLogEntry>, CancellationToken, Task> BuildComposedFlushIfNeeded(BatchLoggerOptions options, ILogger sink)
     {
-        // ✅ If a custom handler was provided by the user, skip composition entirely.
         if (options.OnFlushAsync is not null)
         {
             return null;
@@ -668,31 +501,26 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
 
         var activeSinks = new List<IBatchSink>(capacity: 4);
 
-        // ✅ Add file sink if enabled
         if (options.File?.Enabled == true)
         {
             activeSinks.Add(new FileBatchSink(options.File, options.Format));
         }
 
-        // ✅ Add database sink if enabled
         if (options.Database?.Enabled == true)
         {
             activeSinks.Add(new DatabaseBatchSink(options.Database, options.Format));
         }
 
-        // ✅ If no real sinks, return null → BatchLogger falls back to default ILogger flushing
         if (activeSinks.Count == 0)
         {
             return null;
         }
 
-        // ✅ If at least one real sink exists and forwarding to ILogger is requested, include LoggerBatchSink
         if (options.ForwardToILoggerSink)
         {
             activeSinks.Add(new ForwardingBatchSink(sink));
         }
 
-        // ✅ Return composed async delegate that writes to all active sinks
         return async (entries, token) =>
         {
             List<Exception> errors = [];
@@ -705,12 +533,10 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
                 }
                 catch (OperationCanceledException)
                 {
-                    // Preserve cooperative cancellation for upstream callers
                     throw;
                 }
                 catch (Exception ex)
                 {
-                    // Track the sink error, and notify via OnInternalError if configured
                     errors.Add(ex);
                     try
                     {
@@ -722,28 +548,14 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
                     }
                 }
             }
-
-            // Optional future telemetry or aggregation of `errors` could go here.
-            // For now, we simply swallow after notifying the error handler.
         };
     }
 
-    // -------------- Internal sink types ----------------
-
-    /// <summary>
-    /// Simple sink abstraction for batch-oriented writes.
-    /// </summary>
     private interface IBatchSink
     {
-        /// <summary>
-        /// Writes a batch of log entries to the target sink.
-        /// </summary>
-        /// <param name="entries">The entries to write.</param>
-        /// <param name="token">Cancellation token.</param>
         Task WriteAsync(IReadOnlyList<BatchLogEntry> entries, CancellationToken token);
     }
 
-    // ✅ Real forwarding sink to underlying ILogger
     private sealed class ForwardingBatchSink : IBatchSink
     {
         private readonly ILogger _sink;
@@ -760,10 +572,6 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
         }
     }
 
-    /// <summary>
-    /// Rolling file batch sink with minimal dependencies.
-    /// Supports rolling by interval and size, as well as JSON and plain-text formats.
-    /// </summary>
     private sealed class FileBatchSink : IBatchSink
     {
         private readonly BatchFileOptions _opts;
@@ -771,26 +579,18 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
 
         private static readonly JsonSerializerOptions _defaultJson = new() { WriteIndented = false };
 
-        /// <summary>
-        /// Creates a new file batch sink.
-        /// </summary>
-        /// <param name="opts">File rolling and path options.</param>
-        /// <param name="fmt">Formatting options for JSON and args serialization.</param>
         public FileBatchSink(BatchFileOptions opts, BatchFormatOptions fmt)
         {
             _opts = opts;
             _fmt = fmt ?? new BatchFormatOptions();
-
-            // Ensure the directory exists before writing.
             _ = Directory.CreateDirectory(Path.GetDirectoryName(GetCurrentPath())!);
         }
 
-        /// <inheritdoc />
         public async Task WriteAsync(IReadOnlyList<BatchLogEntry> entries, CancellationToken token)
         {
             var path = GetCurrentPath();
+            var batchTimestamp = DateTime.UtcNow;
 
-            // Roll by size when configured and the active file exceeds the threshold.
             if (File.Exists(path) && _opts.RollingSizeBytes > 0)
             {
                 var len = new FileInfo(path).Length;
@@ -800,23 +600,22 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
                 }
             }
 
-            // Append mode with async file I/O; share read to allow tailing.
             await using var stream = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite, 4096, useAsync: true);
             await using var writer = new StreamWriter(stream, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
 
-            // Write each entry as a single line using the requested format.
-            var now = DateTime.UtcNow;
             foreach (var e in entries)
             {
                 token.ThrowIfCancellationRequested();
-                var line = Format(e, _fmt, _opts.Format, now);
+
+                var dateTime = _fmt.UsePerEntryTimestamp ? DateTime.UtcNow : batchTimestamp;
+
+                var line = Format(e, _fmt, _opts.Format, dateTime);
                 await writer.WriteLineAsync(line.AsMemory(), token).ConfigureAwait(false);
             }
 
             await writer.FlushAsync(token).ConfigureAwait(false);
         }
 
-        // Computes the current file path based on rolling interval.
         private string GetCurrentPath()
         {
             if (_opts.RollingInterval == RollingInterval.None)
@@ -829,7 +628,7 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
             {
                 RollingInterval.Hour => stamp.ToString("yyyyMMdd_HH", CultureInfo.InvariantCulture),
                 RollingInterval.Day => stamp.ToString("yyyyMMdd", CultureInfo.InvariantCulture),
-                RollingInterval.Week => $"{ISOWeek.GetYear(stamp)}-W{ISOWeek.GetWeekOfYear(stamp):D2}",
+                RollingInterval.Week => $"{stamp.AddDays(-(int)stamp.DayOfWeek + (int)DayOfWeek.Monday).ToString("yyyyMMdd", CultureInfo.InvariantCulture)}-W{ISOWeek.GetWeekOfYear(stamp):D2}",
                 RollingInterval.Month => stamp.ToString("yyyyMM", CultureInfo.InvariantCulture),
                 RollingInterval.Year => stamp.ToString("yyyy", CultureInfo.InvariantCulture),
                 _ => stamp.ToString("yyyyMMdd", CultureInfo.InvariantCulture)
@@ -841,7 +640,6 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
             return Path.Combine(dir, $"{file}-{suffix}{ext}");
         }
 
-        // Rolls files by moving suffixes .N to .N+1 and current to .1; keeps RetainedFileCountLimit files.
         private void RollFiles()
         {
             var path = GetCurrentPath();
@@ -875,7 +673,6 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
             SafeMove(path, $"{path}.1");
         }
 
-        // Formats a single entry according to the configured file format and serialization options.
         private static string Format(BatchLogEntry e, BatchFormatOptions fmt, BatchFileFormat fileFormat, DateTime now)
         {
             if (fileFormat == BatchFileFormat.Json)
@@ -892,9 +689,8 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
                 return JsonSerializer.Serialize(payload, fmt.JsonSerializerOptions ?? new JsonSerializerOptions { WriteIndented = false });
             }
 
-            // Plain text format: "{TimestampUtc:O} [Level] Message | args=<json> | ex=<exception>"
             var sb = new StringBuilder(256);
-            _ = sb.Append(DateTime.UtcNow.ToString("O"))
+            _ = sb.Append(now.ToString("O"))
                   .Append(" [").Append(e.Level).Append("] ")
                   .Append(e.Message ?? "N/A");
 
@@ -912,41 +708,28 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
         }
     }
 
-    /// <summary>
-    /// Minimal ADO.NET batch inserter that works with providers registered via <see cref="DbProviderFactories"/>.
-    /// Creates a connection per flush and inserts rows using parameterized commands.
-    /// Optionally creates the log table if <see cref="BatchDatabaseOptions.AutoCreateTable"/> is set.
-    /// </summary>
     private sealed class DatabaseBatchSink : IBatchSink
     {
         private readonly BatchDatabaseOptions _opts;
         private readonly BatchFormatOptions _fmt;
-
         private static readonly JsonSerializerOptions _defaultJson = new() { WriteIndented = false };
 
-        /// <summary>
-        /// Initializes a new instance of the <see cref="DatabaseBatchSink"/> class.
-        /// </summary>
-        /// <param name="opts">Database connection and schema options.</param>
-        /// <param name="fmt">JSON formatting options for args column.</param>
-        /// <exception cref="ArgumentException">Thrown if required database options are missing.</exception>
         public DatabaseBatchSink(BatchDatabaseOptions opts, BatchFormatOptions fmt)
         {
-            _opts = opts;
+            _opts = opts ?? throw new ArgumentNullException(nameof(opts));
             _fmt = fmt ?? new BatchFormatOptions();
 
             if (string.IsNullOrWhiteSpace(_opts.ProviderInvariantName))
             {
-                throw new ArgumentException("Database.ProviderInvariantName is required.");
+                throw new ArgumentException("Database.ProviderInvariantName is required.", nameof(opts));
             }
 
             if (string.IsNullOrWhiteSpace(_opts.ConnectionString))
             {
-                throw new ArgumentException("Database.ConnectionString is required.");
+                throw new ArgumentException("Database.ConnectionString is required.", nameof(opts));
             }
         }
 
-        /// <inheritdoc />
         public async Task WriteAsync(IReadOnlyList<BatchLogEntry> entries, CancellationToken token)
         {
             var factory = DbProviderFactories.GetFactory(_opts.ProviderInvariantName);
@@ -955,7 +738,6 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
             conn.ConnectionString = _opts.ConnectionString;
             await conn.OpenAsync(token).ConfigureAwait(false);
 
-            // Optionally create the table. Failures are ignored (permissions/races).
             if (_opts.AutoCreateTable)
             {
                 try
@@ -966,29 +748,36 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
                 }
                 catch
                 {
-                    // Ignore table creation errors (another instance may have created it).
+                    // Ignore table creation race conditions (e.g., table already exists)
                 }
             }
 
-            // Insert each entry using parameterized commands (portable across providers).
             await using var dataCommand = conn.CreateCommand();
             dataCommand.CommandText = _opts.GetInsertSql();
 
+            static string P(string name) => name.Length > 0 && name[0] == '@' ? name : $"@{name}";
+
             var pTs = dataCommand.CreateParameter();
-            pTs.ParameterName = $"@{_opts.ColTimestamp}";
+            pTs.ParameterName = P(_opts.ColTimestamp);
             _ = dataCommand.Parameters.Add(pTs);
+
             var pLvl = dataCommand.CreateParameter();
-            pLvl.ParameterName = $"@{_opts.ColLevel}";
+            pLvl.ParameterName = P(_opts.ColLevel);
             _ = dataCommand.Parameters.Add(pLvl);
+
             var pMsg = dataCommand.CreateParameter();
-            pMsg.ParameterName = $"@{_opts.ColMessage}";
+            pMsg.ParameterName = P(_opts.ColMessage);
             _ = dataCommand.Parameters.Add(pMsg);
+
             var pExc = dataCommand.CreateParameter();
-            pExc.ParameterName = $"@{_opts.ColException}";
+            pExc.ParameterName = P(_opts.ColException);
             _ = dataCommand.Parameters.Add(pExc);
+
             var pArgs = dataCommand.CreateParameter();
-            pArgs.ParameterName = $"@{_opts.ColArgsJson}";
+            pArgs.ParameterName = P(_opts.ColArgsJson);
             _ = dataCommand.Parameters.Add(pArgs);
+
+            var jsonOpts = _fmt.JsonSerializerOptions ?? _defaultJson;
 
             foreach (var entry in entries)
             {
@@ -996,10 +785,10 @@ public sealed class BatchLogger : ILogger, IDisposable, IAsyncDisposable
 
                 pTs.Value = DateTime.UtcNow;
                 pLvl.Value = entry.Level.ToString();
-                pMsg.Value = entry.Message ?? "";
+                pMsg.Value = entry.Message ?? string.Empty;
                 pExc.Value = entry.Exception?.ToString() ?? (object)DBNull.Value;
                 pArgs.Value = (entry.Args is { Count: > 0 })
-                    ? JsonSerializer.Serialize(entry.Args, _fmt.JsonSerializerOptions ?? _defaultJson)
+                    ? JsonSerializer.Serialize(entry.Args, jsonOpts)
                     : DBNull.Value;
 
                 _ = await dataCommand.ExecuteNonQueryAsync(token).ConfigureAwait(false);

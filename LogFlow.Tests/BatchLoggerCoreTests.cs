@@ -20,11 +20,9 @@ public class BatchLogger_CoreTests
         BatchLoggerOptions opts = null)
     {
         sinkMock ??= new Mock<ILogger>();
-        // Let everything be enabled
         sinkMock.Setup(l => l.IsEnabled(It.IsAny<LogLevel>())).Returns(true);
         return new BatchLogger(sinkMock.Object, opts ?? new BatchLoggerOptions
         {
-            // keep things snappy in tests
             BatchSize = 8,
             FlushInterval = System.TimeSpan.FromMilliseconds(50),
             ForwardToILoggerSink = true
@@ -75,7 +73,6 @@ public class BatchLogger_CoreTests
         logger.ExLogWarning("will pass");
         await logger.FlushAsync();
 
-        // Only warning or above should have been forwarded
         sink.Verify(l => l.Log(LogLevel.Information,
             It.IsAny<EventId>(), It.IsAny<It.IsAnyType>(),
             It.IsAny<Exception>(),
@@ -103,7 +100,6 @@ public class BatchLogger_CoreTests
 
         await using var logger = MakeLogger(sink);
 
-        // Call ILogger-style Log<TState> directly to exercise state path
         logger.Log(LogLevel.Information, new EventId(1, "e"),
             new KvState(("a", 1), ("b", null), ("c", "z")),
             null,
@@ -111,7 +107,6 @@ public class BatchLogger_CoreTests
 
         await logger.FlushAsync();
 
-        // Capture the forwarded structured state and confirm formatted message
         sink.Verify(l => l.Log(
             LogLevel.Information,
             It.IsAny<EventId>(),
@@ -119,9 +114,6 @@ public class BatchLogger_CoreTests
             null,
             It.IsAny<Func<It.IsAnyType, Exception, string>>()), Times.AtLeastOnce);
 
-        // We also assert that our filter logic saw args values [1,"N/A","z"] by logging again and intercepting
-        // (Moq can't easily pull the args list out of MEL's internal state object, so we assert by reusing the code path:)
-        // Create an OnFlushAsync to capture what BatchLogger enqueued:
         var captured = new List<BatchLogEntry>();
         var opts = new BatchLoggerOptions
         {
@@ -153,7 +145,7 @@ public class BatchLogger_CoreTests
         var called = 0;
         var opts = new BatchLoggerOptions
         {
-            BatchSize = 1000, // won't hit
+            BatchSize = 1000,
             FlushInterval = System.TimeSpan.FromMilliseconds(50),
             OnFlushAsync = (entries, _) => { Interlocked.Add(ref called, entries.Count); return Task.CompletedTask; }
         };
@@ -165,7 +157,6 @@ public class BatchLogger_CoreTests
         logger.ExLogInformation("a");
         logger.ExLogInformation("b");
 
-        // Wait until a timer-based flush happens
         await SpinWaitAsync(() => called >= 2, 2000);
 
         Assert.True(called >= 2);
@@ -203,13 +194,11 @@ public class BatchLogger_CoreTests
 
         await using var logger = MakeLogger(sink, opts);
 
-        // Stop worker to simulate backpressure
         var ctsField = typeof(BatchLogger)
             .GetField("_cts", BindingFlags.NonPublic | BindingFlags.Instance);
         var cts = (CancellationTokenSource)ctsField.GetValue(logger)!;
         await cts.CancelAsync();
 
-        // Flood the channel
         for (var i = 0; i < 200; i++)
         {
             logger.ExLogInformation("msg {i}", i);
@@ -235,7 +224,6 @@ public class BatchLogger_CoreTests
         var sink = new Mock<ILogger>();
         sink.Setup(l => l.IsEnabled(It.IsAny<LogLevel>())).Returns(true);
 
-        // Dispose()
         var logger1 = MakeLogger(sink, opts);
         for (var i = 0; i < 10; i++)
         {
@@ -244,7 +232,6 @@ public class BatchLogger_CoreTests
 
         await logger1.DisposeAsync();
 
-        // DisposeAsync()
         var logger2 = MakeLogger(sink, opts);
         for (var i = 0; i < 10; i++)
         {
@@ -262,7 +249,6 @@ public class BatchLogger_CoreTests
         var sink = new Mock<ILogger>();
         sink.Setup(l => l.IsEnabled(It.IsAny<LogLevel>())).Returns(true);
 
-        // Return a real scope
         var disposable = Mock.Of<System.IDisposable>();
         sink.Setup(l => l.BeginScope(It.IsAny<object>())).Returns(disposable);
         using var logger = MakeLogger(sink);
@@ -270,7 +256,6 @@ public class BatchLogger_CoreTests
         using var s1 = logger.BeginScope(("k", "v"));
         Assert.Same(disposable, s1);
 
-        // Return null -> expect non-null placeholder (no throw)
         sink.Setup(l => l.BeginScope(It.IsAny<object>())).Returns((System.IDisposable)null);
         using var s2 = logger.BeginScope(("k2", "v2"));
         Assert.NotNull(s2);
